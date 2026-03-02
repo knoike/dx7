@@ -1,0 +1,7 @@
+/target/
+*.mid
+*.wav
+*.zip
+/dexed/
+/sysex/JackDeckard/
+/sysex/Keys/

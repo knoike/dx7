@@ -1,0 +1,9 @@
+[package]
+name = "dx7-core"
+version = "0.1.0"
+edition = "2021"
+description = "DX7 FM synthesizer engine — platform-independent library"
+
+[features]
+default = ["std"]
+std = []

@@ -1,0 +1,3 @@
+[workspace]
+members = ["dx7-core", "dx7-app"]
+resolver = "2"

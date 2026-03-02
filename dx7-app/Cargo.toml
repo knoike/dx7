@@ -1,0 +1,14 @@
+[package]
+name = "dx7-app"
+version = "0.1.0"
+edition = "2021"
+description = "DX7 FM synthesizer — CLI application"
+
+[dependencies]
+dx7-core = { path = "../dx7-core", features = ["std"] }
+cpal = "0.15"
+midir = "0.10"
+hound = "3.5"
+crossterm = "0.28"
+clap = { version = "4", features = ["derive"] }
+ringbuf = "0.4"
