@@ -4,7 +4,7 @@ use crate::patch::DxVoice;
 use crate::tables::{self, N};
 use crate::voice::{Voice, VoiceState};
 
-const MAX_VOICES: usize = 32;
+const DEFAULT_MAX_VOICES: usize = 32;
 
 /// Commands that can be sent to the synth from other threads.
 #[derive(Clone, Debug)]
@@ -25,7 +25,10 @@ pub struct Synth {
     sustained_notes: Vec<u8>,
     master_volume: f32,
     expression: f32,
-    pitch_bend_semitones: f64,
+    /// Pitch bend in the internal log-frequency domain (±12 semitones).
+    pitch_bend_logfreq: i32,
+    /// Mod wheel value (0–127). Scales LFO pitch/amp modulation depth.
+    mod_wheel: i32,
     /// Internal scratch buffer for mixing (one N-sample block).
     mix_buffer: [i32; N],
     /// Residue buffer for sub-block alignment in render_mono.
@@ -38,13 +41,17 @@ pub struct Synth {
 
 impl Synth {
     pub fn new(sample_rate: f64) -> Self {
+        Self::with_max_voices(sample_rate, DEFAULT_MAX_VOICES)
+    }
+
+    pub fn with_max_voices(sample_rate: f64, max_voices: usize) -> Self {
         // Initialize all lookup tables (must be done once before any rendering)
         tables::init_tables(sample_rate);
         crate::lfo::init_lfo(sample_rate);
         crate::pitchenv::init_pitchenv(sample_rate);
 
-        let mut voices = Vec::with_capacity(MAX_VOICES);
-        for _ in 0..MAX_VOICES {
+        let mut voices = Vec::with_capacity(max_voices);
+        for _ in 0..max_voices {
             voices.push(Voice::new());
         }
 
@@ -56,7 +63,8 @@ impl Synth {
             sustained_notes: Vec::new(),
             master_volume: 0.5,
             expression: 1.0,
-            pitch_bend_semitones: 0.0,
+            pitch_bend_logfreq: 0,
+            mod_wheel: 0,
             mix_buffer: [0i32; N],
             mono_residue: [0.0; N],
             mono_residue_len: 0,
@@ -149,6 +157,10 @@ impl Synth {
 
     pub fn control_change(&mut self, cc: u8, value: u8) {
         match cc {
+            1 => {
+                // Mod wheel — scales LFO pitch/amp modulation depth
+                self.mod_wheel = value as i32;
+            }
             7 => {
                 self.master_volume = value as f32 / 127.0;
             }
@@ -156,7 +168,7 @@ impl Synth {
                 self.expression = value as f32 / 127.0;
             }
             64 => {
-                self.sustain = value >= 64;
+                self.sustain = value >= 64; // standard MIDI sustain pedal threshold
                 if !self.sustain {
                     let notes: Vec<u8> = self.sustained_notes.drain(..).collect();
                     for note in notes {
@@ -172,8 +184,11 @@ impl Synth {
         }
     }
 
-    pub fn pitch_bend(&mut self, _value: i16) {
-        self.pitch_bend_semitones = _value as f64 / 8192.0 * 2.0;
+    pub fn pitch_bend(&mut self, value: i16) {
+        // DX7 native: ±12 semitones = ±1 octave = ±(1<<24) in logfreq domain.
+        // MIDI pitch bend range: -8192..+8191.
+        // (1<<24) / 8192 = 2048.
+        self.pitch_bend_logfreq = value as i32 * 2048;
     }
 
     /// Render audio into the output buffer (interleaved stereo f32, -1.0..1.0).
@@ -191,6 +206,8 @@ impl Synth {
             // Render all active voices into mix buffer
             for voice in &mut self.voices {
                 if voice.state != VoiceState::Inactive {
+                    voice.pitch_bend = self.pitch_bend_logfreq;
+                    voice.mod_wheel = self.mod_wheel;
                     let mut voice_buf = [0i32; N];
                     voice.render(&mut voice_buf);
                     for i in 0..block_frames {
@@ -248,6 +265,8 @@ impl Synth {
 
             for voice in &mut self.voices {
                 if voice.state != VoiceState::Inactive {
+                    voice.pitch_bend = self.pitch_bend_logfreq;
+                    voice.mod_wheel = self.mod_wheel;
                     let mut voice_buf = [0i32; N];
                     voice.render(&mut voice_buf);
                     for i in 0..N {

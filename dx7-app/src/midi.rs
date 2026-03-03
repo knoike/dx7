@@ -82,7 +82,7 @@ impl MidiHandler {
 }
 
 /// Parse a raw MIDI message into a SynthCommand.
-fn parse_midi_message(msg: &[u8]) -> Option<SynthCommand> {
+pub fn parse_midi_message(msg: &[u8]) -> Option<SynthCommand> {
     if msg.is_empty() {
         return None;
     }

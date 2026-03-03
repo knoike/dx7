@@ -123,6 +123,87 @@ impl DxVoice {
         }
     }
 
+    /// Serialize to packed format (128 bytes, same as bulk dump per-voice).
+    pub fn to_packed(&self) -> [u8; 128] {
+        let mut d = [0u8; 128];
+
+        for i in 0..6 {
+            let op = &self.operators[i];
+            let base = i * 17;
+
+            // EG rates and levels (bytes 0-7)
+            d[base]     = op.eg.rates[0];
+            d[base + 1] = op.eg.rates[1];
+            d[base + 2] = op.eg.rates[2];
+            d[base + 3] = op.eg.rates[3];
+            d[base + 4] = op.eg.levels[0];
+            d[base + 5] = op.eg.levels[1];
+            d[base + 6] = op.eg.levels[2];
+            d[base + 7] = op.eg.levels[3];
+
+            d[base + 8]  = op.kbd_level_scaling_break_point;
+            d[base + 9]  = op.kbd_level_scaling_left_depth;
+            d[base + 10] = op.kbd_level_scaling_right_depth;
+
+            // Byte 11: left_curve[1:0] | right_curve[3:2]
+            d[base + 11] = op.kbd_level_scaling_left_curve.to_u8()
+                         | (op.kbd_level_scaling_right_curve.to_u8() << 2);
+
+            // Byte 12: rate_scaling[2:0] | detune[6:3]
+            d[base + 12] = (op.kbd_rate_scaling & 0x07)
+                         | ((op.osc_detune & 0x0F) << 3);
+
+            // Byte 13: amp_mod_sens[1:0] | key_vel_sens[4:2]
+            d[base + 13] = (op.amp_mod_sensitivity & 0x03)
+                         | ((op.key_velocity_sensitivity & 0x07) << 2);
+
+            d[base + 14] = op.output_level;
+
+            // Byte 15: osc_mode[0] | freq_coarse[5:1]
+            d[base + 15] = (op.osc_mode & 0x01)
+                         | ((op.osc_freq_coarse & 0x1F) << 1);
+
+            d[base + 16] = op.osc_freq_fine;
+        }
+
+        let gb = 102;
+
+        // Pitch EG
+        d[gb]     = self.pitch_eg.rates[0];
+        d[gb + 1] = self.pitch_eg.rates[1];
+        d[gb + 2] = self.pitch_eg.rates[2];
+        d[gb + 3] = self.pitch_eg.rates[3];
+        d[gb + 4] = self.pitch_eg.levels[0];
+        d[gb + 5] = self.pitch_eg.levels[1];
+        d[gb + 6] = self.pitch_eg.levels[2];
+        d[gb + 7] = self.pitch_eg.levels[3];
+
+        // Algorithm
+        d[gb + 8] = self.algorithm & 0x1F;
+
+        // OscKeySync[3] | Feedback[2:0]
+        d[gb + 9] = (self.feedback & 0x07)
+                   | (if self.osc_key_sync { 0x08 } else { 0 });
+
+        // LFO
+        d[gb + 10] = self.lfo.speed;
+        d[gb + 11] = self.lfo.delay;
+        d[gb + 12] = self.lfo.pitch_mod_depth;
+        d[gb + 13] = self.lfo.amp_mod_depth;
+
+        // LFO PitchModSens[6:4] | LFO Wave[3:1] | LFO Sync[0]
+        d[gb + 14] = (if self.lfo.key_sync { 1 } else { 0 })
+                    | ((self.lfo.waveform.to_u8() & 0x07) << 1)
+                    | ((self.pitch_mod_sensitivity & 0x07) << 4);
+
+        d[gb + 15] = self.transpose;
+
+        // Name (bytes 118-127)
+        d[gb + 16..gb + 26].copy_from_slice(&self.name);
+
+        d
+    }
+
     /// Parse a single voice from packed format (128 bytes per voice in bulk dump).
     pub fn from_packed(data: &[u8; 128]) -> Self {
         let mut ops = [OperatorParams::default(); 6];

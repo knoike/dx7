@@ -1,8 +1,20 @@
-Note: still experimental.  Sound quality is terrrible.
+<p align="center">
+  <img src="dx7.png" alt="Yamaha DX7" width="600">
+</p>
 
 # DX7
 
 A Yamaha DX7 FM synthesizer emulator in Rust.
+
+## Demo
+
+E.PIANO 1 solo — "Greatest Love of All" intro (DX7's iconic FM electric piano):
+
+- [E.Piano 1 Intro](demo/epiano1_intro_demo.wav)
+
+Full GM MIDI rendering with 128-program sound set:
+
+- [Greatest Love of All](demo/Greatest-Love-Of-All-1.wav)
 
 ## Structure
 
@@ -50,6 +62,14 @@ cargo run --release --package dx7-app -- --render output.wav --note 60 --velocit
 cargo run --release --package dx7-app -- --midi-file song.mid --sysex sysex/rom1a.syx --patch 3 --render output.wav
 ```
 
+### GM mode
+
+Render a MIDI file using the built-in General MIDI sound set (128 programs mapped to DX7 patches):
+
+```
+cargo run --release --package dx7-app -- --midi-file song.mid --render output.wav --gm
+```
+
 Use `--track 1 --track 2` to render specific tracks only.
 
 ### List MIDI ports
@@ -74,12 +94,10 @@ The `sysex/` directory contains the four official DX7 factory ROM banks:
 - Integer log/exp domain math matching the YM21280 OPS chip
 - Per-operator amplitude envelopes, pitch envelope, LFO
 - 4th-order Butterworth output filter at 10.5 kHz (DX7 reconstruction filter)
-- Stereo reverb and soft saturation
-
-MIDI file rendering includes a synthesized drum machine for GM channel 10 (kick, snare, hi-hat, toms, cymbals).
+- DC-blocking filter, stereo reverb, and soft saturation
+- GM sound set with 128 programs and synthesized drum machine (channel 10)
 
 ## Reference
 
 - [music-synthesizer-for-android](https://github.com/google/music-synthesizer-for-android) (msfa) engine
 - [Dexed](https://github.com/asb2m10/dexed)
-

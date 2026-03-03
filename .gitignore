@@ -1,7 +1,11 @@
 /target/
 *.mid
 *.wav
+!demo/*.wav
 *.zip
+*.mp3
+*.xlsx
 /dexed/
+/midi/
 /sysex/JackDeckard/
 /sysex/Keys/

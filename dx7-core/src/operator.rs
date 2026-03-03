@@ -26,6 +26,15 @@ impl ScalingCurve {
             _ => unreachable!(),
         }
     }
+
+    pub fn to_u8(self) -> u8 {
+        match self {
+            ScalingCurve::NegLin => 0,
+            ScalingCurve::NegExp => 1,
+            ScalingCurve::PosExp => 2,
+            ScalingCurve::PosLin => 3,
+        }
+    }
 }
 
 /// All per-operator DX7 parameters (21 params per operator in SysEx).

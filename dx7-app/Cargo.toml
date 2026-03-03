@@ -4,6 +4,13 @@ version = "0.1.0"
 edition = "2021"
 description = "DX7 FM synthesizer — CLI application"
 
+[features]
+default = []
+bluetooth = [
+    "bluer", "tokio", "futures",
+    "objc2", "objc2-foundation", "objc2-core-bluetooth", "dispatch2",
+]
+
 [dependencies]
 dx7-core = { path = "../dx7-core", features = ["std"] }
 cpal = "0.15"
@@ -11,4 +18,16 @@ midir = "0.10"
 hound = "3.5"
 crossterm = "0.28"
 clap = { version = "4", features = ["derive"] }
+midly = "0.5"
 ringbuf = "0.4"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+bluer = { version = "0.17", features = ["bluetoothd"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util"], optional = true }
+futures = { version = "0.3", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6", optional = true }
+objc2-foundation = { version = "0.3", optional = true, features = ["NSString", "NSData", "NSArray", "NSDictionary", "NSError"] }
+objc2-core-bluetooth = { version = "0.3", optional = true }
+dispatch2 = { version = "0.3", optional = true }

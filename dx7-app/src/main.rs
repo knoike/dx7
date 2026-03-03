@@ -7,6 +7,10 @@
 //!   dx7-app --list-midi              # List MIDI ports
 
 mod audio;
+#[cfg(feature = "bluetooth")]
+mod bluetooth;
+mod gm;
+mod gm_rom;
 mod keyboard;
 mod midi;
 
@@ -62,6 +66,21 @@ struct Args {
     #[arg(long)]
     track: Option<Vec<usize>>,
 
+    /// Map MIDI channels to specific DX7 patches: ch2=sysex/rom1a.syx:21
+    /// Append @vol,reverb to mix (e.g. ch5=file:3@1.5,0.3 for 1.5x vol, 0.3 reverb send).
+    /// Can be specified multiple times. Channel numbers are 1-based.
+    #[arg(long = "ch", value_name = "CHn=FILE:VOICE[@VOL[,REV]]")]
+    channel_map: Vec<String>,
+
+    /// Enable General MIDI sound set (maps program changes to DX7 patches).
+    /// Requires sysex/ directory with factory, vrc, and greymatter banks.
+    #[arg(long)]
+    gm: bool,
+
+    /// Enable BLE MIDI peripheral mode (requires BlueZ on Linux)
+    #[cfg(feature = "bluetooth")]
+    #[arg(long)]
+    bluetooth: bool,
 }
 
 fn main() {
@@ -153,6 +172,10 @@ fn render_wav(output_path: &str, patch: &DxVoice, args: &Args) {
     synth.note_off(args.note);
     synth.render_mono(&mut all_samples[note_samples..]);
 
+    // DC-blocking filter (simulates DX7 analog output coupling caps)
+    let mut dc = dx7_core::effects::DcBlocker::new(sample_rate as f64);
+    dc.process(&mut all_samples);
+
     let spec = hound::WavSpec {
         channels: 1,
         sample_rate,
@@ -192,185 +215,82 @@ enum MidiEventKind {
 
 /// Parse a Standard MIDI File, returning events sorted by tick.
 fn parse_midi_file(data: &[u8], track_filter: &Option<Vec<usize>>) -> (u16, Vec<MidiEvent>) {
-    // Header
-    assert_eq!(&data[0..4], b"MThd");
-    let _hdr_len = u32::from_be_bytes(data[4..8].try_into().unwrap());
-    let _fmt = u16::from_be_bytes(data[8..10].try_into().unwrap());
-    let ntracks = u16::from_be_bytes(data[10..12].try_into().unwrap());
-    let division = u16::from_be_bytes(data[12..14].try_into().unwrap());
+    let smf = midly::Smf::parse(data).expect("Failed to parse MIDI file");
+
+    let tpb = match smf.header.timing {
+        midly::Timing::Metrical(tpb) => tpb.as_int(),
+        midly::Timing::Timecode(..) => panic!("SMPTE timecode not supported"),
+    };
 
     let mut all_events = Vec::new();
-    let mut pos = 14usize;
 
-    for track_idx in 0..ntracks as usize {
-        if &data[pos..pos + 4] != b"MTrk" {
-            break;
-        }
-        let trk_len = u32::from_be_bytes(data[pos + 4..pos + 8].try_into().unwrap()) as usize;
-        let trk_start = pos + 8;
-        let trk_end = trk_start + trk_len;
-
+    for (track_idx, track) in smf.tracks.iter().enumerate() {
         // Always parse track 0 (tempo map), plus selected tracks
         let include = track_idx == 0
             || match track_filter {
                 Some(tracks) => tracks.contains(&track_idx),
                 None => true,
             };
+        if !include {
+            continue;
+        }
 
-        if include {
-            let mut tpos = trk_start;
-            let mut tick: u64 = 0;
-            let mut running_status: u8 = 0;
-
-            while tpos < trk_end {
-                // Variable-length delta
-                let mut delta: u64 = 0;
-                loop {
-                    let b = data[tpos];
-                    tpos += 1;
-                    delta = (delta << 7) | (b & 0x7F) as u64;
-                    if b & 0x80 == 0 {
-                        break;
-                    }
-                }
-                tick += delta;
-
-                let status = data[tpos];
-                if status & 0x80 != 0 {
-                    running_status = status;
-                    tpos += 1;
-                }
-                let cmd = running_status & 0xF0;
-                let channel = running_status & 0x0F;
-
-                match cmd {
-                    0x90 if tpos + 1 < trk_end => {
-                        let note = data[tpos];
-                        let vel = data[tpos + 1];
-                        tpos += 2;
-                        if vel > 0 {
-                            all_events.push(MidiEvent {
-                                tick,
-                                channel,
-                                kind: MidiEventKind::NoteOn { note, velocity: vel },
-                            });
-                        } else {
-                            all_events.push(MidiEvent {
-                                tick,
-                                channel,
-                                kind: MidiEventKind::NoteOff { note },
-                            });
-                        }
-                    }
-                    0x80 if tpos + 1 < trk_end => {
-                        let note = data[tpos];
-                        tpos += 2;
-                        all_events.push(MidiEvent {
-                            tick,
-                            channel,
-                            kind: MidiEventKind::NoteOff { note },
-                        });
-                    }
-                    0xB0 if tpos + 1 < trk_end => {
-                        let cc = data[tpos];
-                        let val = data[tpos + 1];
-                        tpos += 2;
-                        all_events.push(MidiEvent {
-                            tick,
-                            channel,
-                            kind: MidiEventKind::ControlChange { cc, value: val },
-                        });
-                    }
-                    0xE0 if tpos + 1 < trk_end => {
-                        let lsb = data[tpos];
-                        let msb = data[tpos + 1];
-                        tpos += 2;
-                        let bend = ((msb as i16) << 7 | lsb as i16) - 8192;
-                        all_events.push(MidiEvent {
-                            tick,
-                            channel,
-                            kind: MidiEventKind::PitchBend { value: bend },
-                        });
-                    }
-                    0xC0 => {
-                        let program = data[tpos];
-                        tpos += 1;
-                        all_events.push(MidiEvent {
-                            tick,
-                            channel,
-                            kind: MidiEventKind::ProgramChange { program },
-                        });
-                    }
-                    0xA0 | 0xB0 | 0xE0 => {
-                        tpos += 2;
-                    }
-                    0xD0 => {
-                        tpos += 1;
-                    }
-                    _ if running_status == 0xFF => {
-                        // Meta event — status byte was consumed, next is type
-                        let meta_type = data[tpos - 1]; // we already advanced past it
-                        // Actually: when running_status=0xFF, the flow is different.
-                        // Let me re-parse: after 0xFF we read meta_type then var-len then data
-                        // But our code set running_status=0xFF and tpos is past it.
-                        // data[tpos-1] was already read. Let me handle this:
-                        let mt = if status == 0xFF {
-                            let mt = data[tpos];
-                            tpos += 1;
-                            mt
-                        } else {
-                            // running_status shouldn't be 0xFF in normal cases
-                            0
-                        };
-                        let mut meta_len: usize = 0;
-                        loop {
-                            let b = data[tpos];
-                            tpos += 1;
-                            meta_len = (meta_len << 7) | (b & 0x7F) as usize;
-                            if b & 0x80 == 0 {
-                                break;
+        let mut tick: u64 = 0;
+        for event in track {
+            tick += event.delta.as_int() as u64;
+            match event.kind {
+                midly::TrackEventKind::Midi { channel, message } => {
+                    let ch = channel.as_int();
+                    let kind = match message {
+                        midly::MidiMessage::NoteOn { key, vel } => {
+                            if vel.as_int() > 0 {
+                                MidiEventKind::NoteOn {
+                                    note: key.as_int(),
+                                    velocity: vel.as_int(),
+                                }
+                            } else {
+                                MidiEventKind::NoteOff { note: key.as_int() }
                             }
                         }
-                        if mt == 0x51 && meta_len >= 3 {
-                            // Tempo
-                            let tempo = ((data[tpos] as u32) << 16)
-                                | ((data[tpos + 1] as u32) << 8)
-                                | data[tpos + 2] as u32;
-                            all_events.push(MidiEvent {
-                                tick,
-                                channel: 0,
-                                kind: MidiEventKind::Tempo(tempo),
-                            });
+                        midly::MidiMessage::NoteOff { key, .. } => {
+                            MidiEventKind::NoteOff { note: key.as_int() }
                         }
-                        tpos += meta_len;
-                    }
-                    _ if status == 0xF0 || status == 0xF7 => {
-                        // SysEx
-                        let mut syx_len: usize = 0;
-                        loop {
-                            let b = data[tpos];
-                            tpos += 1;
-                            syx_len = (syx_len << 7) | (b & 0x7F) as usize;
-                            if b & 0x80 == 0 {
-                                break;
+                        midly::MidiMessage::Controller { controller, value } => {
+                            MidiEventKind::ControlChange {
+                                cc: controller.as_int(),
+                                value: value.as_int(),
                             }
                         }
-                        tpos += syx_len;
-                    }
-                    _ => {
-                        // Unknown, skip 2 bytes as best guess
-                        tpos += 2;
-                    }
+                        midly::MidiMessage::PitchBend { bend } => {
+                            MidiEventKind::PitchBend {
+                                value: bend.as_int(),
+                            }
+                        }
+                        midly::MidiMessage::ProgramChange { program } => {
+                            MidiEventKind::ProgramChange {
+                                program: program.as_int(),
+                            }
+                        }
+                        _ => continue, // Aftertouch, etc.
+                    };
+                    all_events.push(MidiEvent { tick, channel: ch, kind });
                 }
+                midly::TrackEventKind::Meta(midly::MetaMessage::Tempo(t)) => {
+                    all_events.push(MidiEvent {
+                        tick,
+                        channel: 0,
+                        kind: MidiEventKind::Tempo(t.as_int()),
+                    });
+                }
+                _ => {} // SysEx, other meta — skip
             }
         }
-        pos = trk_end;
     }
 
     // Sort by tick (stable sort preserves order for same-tick events)
     all_events.sort_by_key(|e| e.tick);
 
-    (division, all_events)
+    (tpb, all_events)
 }
 
 // ── Synthesized Drum Machine (GM channel 9) ──────────────────────────
@@ -566,6 +486,81 @@ impl DrumMachine {
     }
 }
 
+/// Parse --ch entries like "ch2=file:21" or "ch5=file:15@2.0,0.3"
+/// into (channel_index, DxVoice, volume, reverb_send).
+fn parse_channel_map(entries: &[String]) -> Vec<(usize, DxVoice, f32, f32)> {
+    let mut result = Vec::new();
+    let mut cache: std::collections::HashMap<String, Vec<DxVoice>> = std::collections::HashMap::new();
+
+    for entry in entries {
+        let parts: Vec<&str> = entry.splitn(2, '=').collect();
+        if parts.len() != 2 || !parts[0].starts_with("ch") {
+            eprintln!("Warning: invalid --ch entry '{}', expected ch<N>=<file>:<voice>[@vol[,rev]]", entry);
+            continue;
+        }
+        let ch_num: usize = match parts[0][2..].parse::<usize>() {
+            Ok(n) if n >= 1 && n <= 16 => n - 1,
+            _ => {
+                eprintln!("Warning: invalid channel in '{}' (must be 1-16)", entry);
+                continue;
+            }
+        };
+
+        // Split off optional @vol,rev suffix
+        let (rhs_str, volume, reverb_send) = if let Some(at_pos) = parts[1].rfind('@') {
+            let params_str = &parts[1][at_pos + 1..];
+            let param_parts: Vec<&str> = params_str.split(',').collect();
+            let vol: f32 = param_parts[0].parse().unwrap_or(1.0);
+            let rev: f32 = if param_parts.len() > 1 {
+                param_parts[1].parse().unwrap_or(0.15)
+            } else {
+                0.15 // default reverb send
+            };
+            (&parts[1][..at_pos], vol, rev)
+        } else {
+            (parts[1], 1.0f32, 0.15f32) // default: 1.0 vol, 0.15 reverb
+        };
+
+        let rhs: Vec<&str> = rhs_str.rsplitn(2, ':').collect();
+        if rhs.len() != 2 {
+            eprintln!("Warning: invalid --ch entry '{}', expected <file>:<voice>", entry);
+            continue;
+        }
+        let voice_idx: usize = match rhs[0].parse() {
+            Ok(n) => n,
+            _ => {
+                eprintln!("Warning: invalid voice index in '{}'", entry);
+                continue;
+            }
+        };
+        let file_path = rhs[1];
+
+        let bank = cache.entry(file_path.to_string()).or_insert_with(|| {
+            let data = std::fs::read(file_path).unwrap_or_else(|e| {
+                eprintln!("Failed to read {}: {}", file_path, e);
+                Vec::new()
+            });
+            DxVoice::parse_bulk_dump(&data).unwrap_or_else(|e| {
+                eprintln!("Failed to parse {}: {}", file_path, e);
+                Vec::new()
+            })
+        });
+
+        if voice_idx >= bank.len() {
+            eprintln!("Warning: voice index {} out of range for {} ({} voices)", voice_idx, file_path, bank.len());
+            continue;
+        }
+
+        let mut mix_str = String::new();
+        if (volume - 1.0).abs() > 0.001 || (reverb_send - 0.15).abs() > 0.001 {
+            mix_str = format!(" @{:.1}x rev={:.0}%", volume, reverb_send * 100.0);
+        }
+        println!("  ch{}: {} [{}:{}]{}", ch_num + 1, bank[voice_idx].name_str(), file_path, voice_idx, mix_str);
+        result.push((ch_num, bank[voice_idx].clone(), volume, reverb_send));
+    }
+    result
+}
+
 fn render_midi_file(midi_path: &str, output_path: &str, patch: &DxVoice, patches: &[DxVoice], args: &Args) {
     let data = std::fs::read(midi_path).expect("Failed to read MIDI file");
     let (division, events) = parse_midi_file(&data, &args.track);
@@ -579,14 +574,60 @@ fn render_midi_file(midi_path: &str, output_path: &str, patch: &DxVoice, patches
     let sample_rate = args.sample_rate;
 
     // Create 16 independent synth instances (one per MIDI channel)
+    // Use 64 voices per synth for offline rendering (concert piano with
+    // sustain pedal can exceed the DX7's original 16-voice limit).
     let mut synths: Vec<dx7_core::Synth> = (0..16)
         .map(|_| {
-            let mut s = dx7_core::Synth::new(sample_rate as f64);
+            let mut s = dx7_core::Synth::with_max_voices(sample_rate as f64, 64);
             s.load_patch(patch.clone());
             s.set_master_volume(0.05);
             s
         })
         .collect();
+
+    // Apply channel map overrides (--ch entries)
+    // Channels with overrides ignore ProgramChange events from the MIDI file.
+    let mut mapped_channels = [false; 16];
+    let mut channel_volume = [1.0f32; 16];
+    let mut channel_reverb = [0.15f32; 16]; // default reverb send per channel
+    channel_reverb[9] = 0.0; // drums: dry by default
+    let mut channel_gm_gain = [1.0f32; 16]; // per-program gain compensation (GM mode)
+    // DC-blocking filters — one per channel.
+    // FM synthesis produces DC offset from asymmetric modulation;
+    // the real DX7's coupling capacitors removed this.
+    let mut dc_blockers: Vec<dx7_core::effects::DcBlocker> = (0..16)
+        .map(|_| dx7_core::effects::DcBlocker::new(sample_rate as f64))
+        .collect();
+    let mut bass_lpf: Vec<Option<dx7_core::effects::LowPassFilter>> = (0..16)
+        .map(|_| None)
+        .collect();
+    if !args.channel_map.is_empty() {
+        println!("Channel map:");
+        let map = parse_channel_map(&args.channel_map);
+        for (ch, voice, vol, rev) in map {
+            synths[ch].load_patch(voice);
+            mapped_channels[ch] = true;
+            channel_volume[ch] = vol;
+            channel_reverb[ch] = rev;
+        }
+    }
+
+    // Load GM sound set if --gm flag is set
+    let gm_set = if args.gm {
+        let gm = gm::GmSoundSet::load("sysex");
+        println!("GM: loaded 128-program sound set");
+        // Set initial patch on all non-mapped channels to GM program 0 (Acoustic Grand Piano)
+        for (ch, synth) in synths.iter_mut().enumerate() {
+            if !mapped_channels[ch] && ch != 9 {
+                if let Some(p) = gm.get(0) {
+                    synth.load_patch(p.clone());
+                }
+            }
+        }
+        Some(gm)
+    } else {
+        None
+    };
 
     // Drum machine for GM channel 10 (index 9)
     let mut drums = DrumMachine::new(sample_rate as f64);
@@ -594,8 +635,33 @@ fn render_midi_file(midi_path: &str, output_path: &str, patch: &DxVoice, patches
     // Render by walking through events, converting tick→sample position
     let mut tempo: u32 = 500_000; // default 120 BPM (standard MIDI default)
     let mut current_tick: u64 = 0;
-    let mut current_sample: u64 = 0;
-    let mut samples: Vec<f32> = Vec::new();
+    let mut _current_sample: u64 = 0;
+    // Per-channel stereo panning (0.0 = hard left, 0.5 = center, 1.0 = hard right)
+    // Default spread gives each active channel a slightly different position.
+    let mut channel_pan = [0.5f32; 16];
+    // Spread synth channels across the stereo field
+    let pan_positions = [
+        0.5,  // ch1: center
+        0.5,  // ch2: center (bass)
+        0.35, // ch3: slightly left
+        0.65, // ch4: slightly right
+        0.25, // ch5: left
+        0.75, // ch6: right
+        0.4,  // ch7: slightly left
+        0.6,  // ch8: slightly right
+        0.5,  // ch9: center
+        0.5,  // ch10: center (drums)
+        0.3,  // ch11-16: spread
+        0.7, 0.35, 0.65, 0.45, 0.55,
+    ];
+    for (i, &p) in pan_positions.iter().enumerate() {
+        channel_pan[i] = p;
+    }
+
+    let mut left_samples: Vec<f32> = Vec::new();
+    let mut right_samples: Vec<f32> = Vec::new();
+    let mut drum_samples: Vec<f32> = Vec::new();
+    let mut reverb_send: Vec<f32> = Vec::new(); // per-channel reverb send (mono)
 
     for event in &events {
         if event.tick > current_tick {
@@ -606,25 +672,41 @@ fn render_midi_file(midi_path: &str, output_path: &str, patch: &DxVoice, patches
             let delta_samples = delta_samples as u64;
 
             if delta_samples > 0 {
-                let start = samples.len();
-                samples.resize(start + delta_samples as usize, 0.0);
-                let slice = &mut samples[start..];
+                let len = delta_samples as usize;
+                let start = left_samples.len();
+                left_samples.resize(start + len, 0.0);
+                right_samples.resize(start + len, 0.0);
+                drum_samples.resize(start + len, 0.0);
+                reverb_send.resize(start + len, 0.0);
 
-                // Mix all 16 synths into the output
-                let mut temp = vec![0.0f32; slice.len()];
-                for synth in &mut synths {
+                // Mix each synth channel with panning
+                let mut temp = vec![0.0f32; len];
+                for (ch_idx, synth) in synths.iter_mut().enumerate() {
                     temp.iter_mut().for_each(|s| *s = 0.0);
                     synth.render_mono(&mut temp);
-                    for (out, t) in slice.iter_mut().zip(temp.iter()) {
-                        *out += *t;
+                    dc_blockers[ch_idx].process(&mut temp);
+                    if let Some(ref mut lpf) = bass_lpf[ch_idx] {
+                        lpf.process(&mut temp);
+                    }
+                    let vol = channel_volume[ch_idx] * channel_gm_gain[ch_idx];
+                    let pan = channel_pan[ch_idx];
+                    // Equal-power panning
+                    let l_gain = (std::f32::consts::FRAC_PI_2 * (1.0 - pan)).cos().max(0.0).sqrt() * vol;
+                    let r_gain = (std::f32::consts::FRAC_PI_2 * pan).cos().max(0.0).sqrt() * vol;
+                    let rev = channel_reverb[ch_idx];
+                    for i in 0..len {
+                        left_samples[start + i] += temp[i] * l_gain;
+                        right_samples[start + i] += temp[i] * r_gain;
+                        reverb_send[start + i] += temp[i] * vol * rev;
                     }
                 }
 
-                // Mix drums
-                drums.render(slice);
+                // Mix drums separately (center)
+                drums.render(&mut drum_samples[start..]);
+
             }
             current_tick = event.tick;
-            current_sample += delta_samples;
+            _current_sample += delta_samples;
         }
 
         let ch = event.channel as usize;
@@ -649,17 +731,31 @@ fn render_midi_file(midi_path: &str, output_path: &str, patch: &DxVoice, patches
                 synths[ch].note_off(*note);
             }
             MidiEventKind::ControlChange { cc, value } => {
-                // Skip CC7 (volume) — we use fixed master_volume + normalization
-                if *cc != 7 {
-                    synths[ch].control_change(*cc, *value);
-                }
+                synths[ch].control_change(*cc, *value);
             }
             MidiEventKind::PitchBend { value } => {
-                synths[ch].pitch_bend(*value);
+                // GM default pitch bend range is ±2 semitones.
+                // DX7 native range is ±12 semitones.
+                // Scale: 2/12 = 1/6.
+                let scaled = (*value as i32 / 6) as i16;
+                synths[ch].pitch_bend(scaled);
             }
             MidiEventKind::ProgramChange { program } => {
-                if let Some(p) = patches.get(*program as usize) {
-                    synths[ch].load_patch(p.clone());
+                // Skip ProgramChange for channels with --ch overrides
+                if !mapped_channels[ch] {
+                    if let Some(ref gm) = gm_set {
+                        // GM mode: map program number to curated DX7 patch
+                        if let Some(p) = gm.get(*program) {
+                            synths[ch].load_patch(p.clone());
+                            channel_gm_gain[ch] = gm::program_gain(*program);
+                            // Bass instruments: dry (no reverb) for tight low end
+                            if gm::is_bass_program(*program) {
+                                channel_reverb[ch] = 0.0;
+                            }
+                        }
+                    } else if let Some(p) = patches.get(*program as usize) {
+                        synths[ch].load_patch(p.clone());
+                    }
                 }
             }
             MidiEventKind::Tempo(t) => {
@@ -670,45 +766,100 @@ fn render_midi_file(midi_path: &str, output_path: &str, patch: &DxVoice, patches
 
     // Render 4s tail for reverb decay
     let tail = (4.0 * sample_rate as f64) as usize;
-    let start = samples.len();
-    samples.resize(start + tail, 0.0);
-    let slice = &mut samples[start..];
-    let mut temp = vec![0.0f32; slice.len()];
-    for synth in &mut synths {
+    let start = left_samples.len();
+    left_samples.resize(start + tail, 0.0);
+    right_samples.resize(start + tail, 0.0);
+    drum_samples.resize(start + tail, 0.0);
+    reverb_send.resize(start + tail, 0.0);
+    let mut temp = vec![0.0f32; tail];
+    for (ch_idx, synth) in synths.iter_mut().enumerate() {
         temp.iter_mut().for_each(|s| *s = 0.0);
         synth.render_mono(&mut temp);
-        for (out, t) in slice.iter_mut().zip(temp.iter()) {
-            *out += *t;
+        dc_blockers[ch_idx].process(&mut temp);
+        if let Some(ref mut lpf) = bass_lpf[ch_idx] {
+            lpf.process(&mut temp);
+        }
+        let vol = channel_volume[ch_idx] * channel_gm_gain[ch_idx];
+        let pan = channel_pan[ch_idx];
+        let l_gain = (std::f32::consts::FRAC_PI_2 * (1.0 - pan)).cos().max(0.0).sqrt() * vol;
+        let r_gain = (std::f32::consts::FRAC_PI_2 * pan).cos().max(0.0).sqrt() * vol;
+        let rev = channel_reverb[ch_idx];
+        for i in 0..tail {
+            left_samples[start + i] += temp[i] * l_gain;
+            right_samples[start + i] += temp[i] * r_gain;
+            reverb_send[start + i] += temp[i] * vol * rev;
         }
     }
-    drums.render(slice);
+    drums.render(&mut drum_samples[start..]);
 
-    // Apply DX7-style output low-pass filter (4th-order Butterworth at 10.5 kHz)
-    // Simulates the reconstruction filter in the DX7's analog output stage
-    let mut lpf = dx7_core::effects::LowPassFilter4::new(sample_rate as f64, 10500.0);
-    lpf.process(&mut samples);
+    let num = left_samples.len();
+
+    // Apply DX7-style output low-pass filter
+    let mut lpf_l = dx7_core::effects::LowPassFilter4::new(sample_rate as f64, 10500.0);
+    let mut lpf_r = dx7_core::effects::LowPassFilter4::new(sample_rate as f64, 10500.0);
+    lpf_l.process(&mut left_samples);
+    lpf_r.process(&mut right_samples);
 
     // Apply soft saturation for analog warmth
-    for s in samples.iter_mut() {
+    for s in left_samples.iter_mut() {
+        *s = dx7_core::effects::soft_saturate(*s);
+    }
+    for s in right_samples.iter_mut() {
         *s = dx7_core::effects::soft_saturate(*s);
     }
 
-    // Mono → stereo (no chorus)
-    let num = samples.len();
-    let mut left = samples.clone();
-    let mut right = samples.clone();
-
-    // Apply reverb (mono sum → stereo reverb, blended in)
+    // Short ambient reverb — adds space without echo
+    // Small room, high damping = early reflections only
     let mut reverb = dx7_core::Reverb::new(sample_rate as f32);
-    reverb.set_params(0.88, 0.35, 0.13);
-    let mono_for_rev: Vec<f32> = (0..num).map(|i| (left[i] + right[i]) * 0.5).collect();
+    // Lexicon-style hall — large room, very low damping for bright shimmering tail
+    reverb.set_params(0.85, 0.45, 0.7);
     let mut rev_l = vec![0.0f32; num];
     let mut rev_r = vec![0.0f32; num];
-    reverb.process_mono_to_stereo(&mono_for_rev, &mut rev_l, &mut rev_r);
+    reverb.process_mono_to_stereo(&reverb_send, &mut rev_l, &mut rev_r);
+
+    let mut left = left_samples;
+    let mut right = right_samples;
     for i in 0..num {
-        left[i] = left[i] * 0.85 + rev_l[i] * 0.15;
-        right[i] = right[i] * 0.85 + rev_r[i] * 0.15;
+        left[i] += rev_l[i] * 0.15;
+        right[i] += rev_r[i] * 0.15;
     }
+
+    // Mix dry drums into center
+    for i in 0..num {
+        left[i] += drum_samples[i];
+        right[i] += drum_samples[i];
+    }
+
+    // Stereo chorus — widens the mix
+    let mut chorus = dx7_core::effects::Chorus::new(
+        sample_rate as f64,
+        0.6,   // LFO rate Hz
+        7.0,   // center delay ms
+        0.8,   // depth ms — subtle widening only, no detuning
+        0.45,  // wet mix — stronger stereo spread
+    );
+    chorus.process_stereo_inplace(&mut left, &mut right);
+
+    // Stereo tremolo — AM modulation for the "wow wow" movement
+    let mut tremolo = dx7_core::effects::StereoTremolo::new(
+        sample_rate as f64,
+        3.5,   // rate Hz — moderate pulse
+        0.35,  // depth — tasteful AM modulation
+    );
+    tremolo.process_stereo(&mut left, &mut right);
+
+    // Exciter — adds harmonic brightness
+    let mut exciter = dx7_core::effects::Exciter::new(
+        sample_rate as f64,
+        3500.0, // HP cutoff for harmonics
+        1.5,    // drive
+        0.08,   // mix — subtle sparkle
+    );
+    exciter.process_stereo(&mut left, &mut right);
+
+    // Stereo widener — boost the side (L-R) component for wider image
+    let widener = dx7_core::effects::StereoWidener::new(1.8);
+    widener.process_stereo(&mut left, &mut right);
 
     // Normalize stereo output to -1 dB headroom
     let peak = left
@@ -781,6 +932,22 @@ fn run_interactive(initial_patch: DxVoice, patches: Vec<DxVoice>, args: &Args) {
         }
     };
     let _ = midi_handler; // Keep connection alive
+
+    #[cfg(feature = "bluetooth")]
+    let _ble_handler = if args.bluetooth {
+        match bluetooth::BleHandler::start(engine.command_sender()) {
+            Ok(h) => {
+                println!("BLE MIDI: Advertising as \"DX7\"");
+                Some(h)
+            }
+            Err(e) => {
+                eprintln!("BLE MIDI: Failed to start ({e})");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     println!();
     println!("Controls:");

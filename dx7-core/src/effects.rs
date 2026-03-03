@@ -247,6 +247,38 @@ impl Chorus {
         }
     }
 
+    /// Process stereo buffers in-place with chorus widening.
+    pub fn process_stereo_inplace(&mut self, left: &mut [f32], right: &mut [f32]) {
+        let lfo_inc = self.lfo_rate / self.sample_rate;
+
+        for i in 0..left.len() {
+            let mono = (left[i] + right[i]) * 0.5;
+            self.delay_line[self.write_pos] = mono;
+
+            let lfo_l = (self.lfo_phase * 2.0 * std::f64::consts::PI).sin();
+            let lfo_r = ((self.lfo_phase + 0.25) * 2.0 * std::f64::consts::PI).sin();
+
+            let delay_l = self.center_delay + self.depth * lfo_l;
+            let delay_r = self.center_delay + self.depth * lfo_r;
+
+            let wet_l = self.read_delay(delay_l);
+            let wet_r = self.read_delay(delay_r);
+
+            let dry = 1.0 - self.mix * 0.5;
+            left[i] = left[i] * dry + wet_l * self.mix;
+            right[i] = right[i] * dry + wet_r * self.mix;
+
+            self.write_pos += 1;
+            if self.write_pos > self.max_delay {
+                self.write_pos = 0;
+            }
+            self.lfo_phase += lfo_inc;
+            if self.lfo_phase >= 1.0 {
+                self.lfo_phase -= 1.0;
+            }
+        }
+    }
+
     #[inline]
     fn read_delay(&self, delay: f64) -> f32 {
         let delay = delay.max(0.0).min(self.max_delay as f64);
@@ -263,6 +295,50 @@ impl Chorus {
         let s0 = self.delay_line[pos0];
         let s1 = self.delay_line[pos1];
         s0 + (s1 - s0) * frac as f32
+    }
+}
+
+// --- DC-blocking high-pass filter ---
+// Simulates the coupling capacitors on the real DX7's analog output.
+// FM synthesis can produce large DC offsets from asymmetric modulation;
+// this removes them while passing all audible frequencies.
+
+/// DC-blocking high-pass filter (two cascaded 1st-order stages).
+///
+/// FM synthesis produces time-varying DC offset from asymmetric modulation.
+/// Two stages give fast DC tracking while preserving bass down to ~40 Hz.
+pub struct DcBlocker {
+    // Stage 1
+    x1a: f64,
+    y1a: f64,
+    // Stage 2
+    x1b: f64,
+    y1b: f64,
+    r: f64,
+}
+
+impl DcBlocker {
+    pub fn new(sample_rate: f64) -> Self {
+        // Per-stage cutoff ~20 Hz.  Two cascaded stages give -6 dB at 20 Hz,
+        // -1.5 dB at 65 Hz (C2), which is acceptable for bass.
+        let r = 1.0 - (2.0 * std::f64::consts::PI * 20.0 / sample_rate);
+        Self { x1a: 0.0, y1a: 0.0, x1b: 0.0, y1b: 0.0, r }
+    }
+
+    /// Process a buffer of samples in-place.
+    pub fn process(&mut self, buf: &mut [f32]) {
+        for sample in buf.iter_mut() {
+            // Stage 1
+            let x0 = *sample as f64;
+            let y0 = x0 - self.x1a + self.r * self.y1a;
+            self.x1a = x0;
+            self.y1a = y0;
+            // Stage 2
+            let y1 = y0 - self.x1b + self.r * self.y1b;
+            self.x1b = y0;
+            self.y1b = y1;
+            *sample = y1 as f32;
+        }
     }
 }
 
@@ -376,5 +452,139 @@ impl LowPassFilter4 {
     pub fn process(&mut self, buf: &mut [f32]) {
         self.stage1.process(buf);
         self.stage2.process(buf);
+    }
+}
+
+/// High-pass filter (2nd-order Butterworth) for the exciter.
+pub struct HighPassFilter {
+    b0: f64,
+    b1: f64,
+    b2: f64,
+    a1: f64,
+    a2: f64,
+    x1: f64,
+    x2: f64,
+    y1: f64,
+    y2: f64,
+}
+
+impl HighPassFilter {
+    pub fn new(sample_rate: f64, cutoff_hz: f64) -> Self {
+        let w0 = 2.0 * std::f64::consts::PI * cutoff_hz / sample_rate;
+        let cos_w0 = w0.cos();
+        let sin_w0 = w0.sin();
+        let alpha = sin_w0 / (2.0 * std::f64::consts::FRAC_1_SQRT_2);
+
+        let b0 = (1.0 + cos_w0) / 2.0;
+        let b1 = -(1.0 + cos_w0);
+        let b2 = (1.0 + cos_w0) / 2.0;
+        let a0 = 1.0 + alpha;
+
+        Self {
+            b0: b0 / a0, b1: b1 / a0, b2: b2 / a0,
+            a1: (-2.0 * cos_w0) / a0, a2: (1.0 - alpha) / a0,
+            x1: 0.0, x2: 0.0, y1: 0.0, y2: 0.0,
+        }
+    }
+
+    pub fn process_sample(&mut self, x0: f64) -> f64 {
+        let y0 = self.b0 * x0 + self.b1 * self.x1 + self.b2 * self.x2
+            - self.a1 * self.y1 - self.a2 * self.y2;
+        self.x2 = self.x1;
+        self.x1 = x0;
+        self.y2 = self.y1;
+        self.y1 = y0;
+        y0
+    }
+}
+
+/// Exciter effect — generates harmonics via soft saturation, then
+/// high-passes to extract only the added brightness and mixes back in.
+pub struct Exciter {
+    hpf: HighPassFilter,
+    drive: f32,
+    mix: f32,
+}
+
+impl Exciter {
+    /// Create an exciter.
+    /// - `sample_rate`: audio sample rate
+    /// - `freq_hz`: high-pass cutoff (harmonics above this are added). ~3000-5000 Hz typical.
+    /// - `drive`: saturation amount (1.0 = mild, 3.0 = aggressive)
+    /// - `mix`: how much of the excited signal to add (0.0-1.0)
+    pub fn new(sample_rate: f64, freq_hz: f64, drive: f32, mix: f32) -> Self {
+        Self {
+            hpf: HighPassFilter::new(sample_rate, freq_hz),
+            drive,
+            mix,
+        }
+    }
+
+    /// Process a stereo pair of buffers in-place.
+    pub fn process_stereo(&mut self, left: &mut [f32], right: &mut [f32]) {
+        for (l, r) in left.iter_mut().zip(right.iter_mut()) {
+            let mono = (*l + *r) * 0.5;
+            // Soft-clip saturation to generate harmonics
+            let driven = (mono * self.drive).tanh();
+            // High-pass to isolate only the generated harmonics
+            let harmonics = self.hpf.process_sample(driven as f64) as f32;
+            // Mix back
+            *l += harmonics * self.mix;
+            *r += harmonics * self.mix;
+        }
+    }
+}
+
+/// Stereo tremolo — LFO modulates amplitude with opposite phase per channel.
+/// Creates the classic "wow wow" pulsing effect heard on 80s ballad recordings.
+pub struct StereoTremolo {
+    phase: f64,
+    rate: f64,       // Hz
+    depth: f32,      // 0.0 = no effect, 1.0 = full mute at trough
+    sample_rate: f64,
+}
+
+impl StereoTremolo {
+    pub fn new(sample_rate: f64, rate_hz: f64, depth: f32) -> Self {
+        Self { phase: 0.0, rate: rate_hz, depth, sample_rate }
+    }
+
+    pub fn process_stereo(&mut self, left: &mut [f32], right: &mut [f32]) {
+        let inc = self.rate / self.sample_rate;
+        let two_pi = 2.0 * std::f64::consts::PI;
+        for (l, r) in left.iter_mut().zip(right.iter_mut()) {
+            // Sine LFO, 90-degree offset between L/R for stereo movement
+            let lfo_l = (self.phase * two_pi).sin() as f32;
+            let lfo_r = ((self.phase + 0.25) * two_pi).sin() as f32;
+            // Map LFO (-1..1) to gain (1-depth .. 1)
+            let gain_l = 1.0 - self.depth * 0.5 * (1.0 - lfo_l);
+            let gain_r = 1.0 - self.depth * 0.5 * (1.0 - lfo_r);
+            *l *= gain_l;
+            *r *= gain_r;
+            self.phase += inc;
+            if self.phase >= 1.0 { self.phase -= 1.0; }
+        }
+    }
+}
+
+/// Stereo widener using mid-side processing.
+/// Boosts the side (L-R) component relative to mid (L+R) to widen the image.
+pub struct StereoWidener {
+    width: f32, // 1.0 = no change, >1.0 = wider, <1.0 = narrower
+}
+
+impl StereoWidener {
+    /// `width`: 1.0 = unchanged, 1.5 = 50% wider, 2.0 = double width
+    pub fn new(width: f32) -> Self {
+        Self { width }
+    }
+
+    pub fn process_stereo(&self, left: &mut [f32], right: &mut [f32]) {
+        for (l, r) in left.iter_mut().zip(right.iter_mut()) {
+            let mid = (*l + *r) * 0.5;
+            let side = (*l - *r) * 0.5;
+            *l = mid + side * self.width;
+            *r = mid - side * self.width;
+        }
     }
 }

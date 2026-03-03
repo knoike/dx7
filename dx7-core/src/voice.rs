@@ -95,6 +95,11 @@ pub struct Voice {
     pitchmodsens: i32,
     ampmoddepth: i32,
 
+    /// Pitch bend offset in the log-frequency domain (set by Synth each block).
+    pub pitch_bend: i32,
+    /// Mod wheel value 0–127 (set by Synth each block). Scales LFO mod depths.
+    pub mod_wheel: i32,
+
     // Intermediate buffers for bus rendering
     buf: [[i32; N]; 2],
 }
@@ -133,6 +138,8 @@ impl Voice {
             pitchmoddepth: 0,
             pitchmodsens: 0,
             ampmoddepth: 0,
+            pitch_bend: 0,
+            mod_wheel: 0,
             buf: [[0; N]; 2],
         }
     }
@@ -278,16 +285,19 @@ impl Voice {
         let lfo_val = self.lfo.getsample();
         let lfo_delay = self.lfo.getdelay();
 
-        // --- Pitch modulation ---
-        let pmd = self.pitchmoddepth as u32 as u64 * lfo_delay as u32 as u64;
+        // --- Pitch modulation (scaled by mod wheel) ---
+        let effective_pmd = (self.pitchmoddepth as i64 * self.mod_wheel as i64 / 127) as i32;
+        let pmd = effective_pmd as u32 as u64 * lfo_delay as u32 as u64;
         let senslfo = self.pitchmodsens * (lfo_val - (1 << 23));
         let pmod_1 = ((pmd as i64 * senslfo as i64) >> 39).unsigned_abs() as i32;
         let pitch_mod = self.pitchenv.getsample()
-            + pmod_1 * if senslfo < 0 { -1 } else { 1 };
+            + pmod_1 * if senslfo < 0 { -1 } else { 1 }
+            + self.pitch_bend;
 
-        // --- Amplitude modulation ---
+        // --- Amplitude modulation (scaled by mod wheel) ---
+        let effective_amd = (self.ampmoddepth as i64 * self.mod_wheel as i64 / 127) as i32;
         let lfo_val_inv = (1 << 24) - lfo_val;
-        let amod_1 = ((self.ampmoddepth as i64 * lfo_delay as i64) >> 8) as u32;
+        let amod_1 = ((effective_amd as i64 * lfo_delay as i64) >> 8) as u32;
         let amod_1 = ((amod_1 as u64 * lfo_val_inv as u64) >> 24) as u32;
         let amd_mod = amod_1;
 
