@@ -10,11 +10,7 @@ A Yamaha DX7 FM synthesizer emulator in Rust.
 
 E.PIANO 1 solo — "Greatest Love of All" intro (DX7's iconic FM electric piano):
 
-- [E.Piano 1 Intro](demo/epiano1_intro_demo.wav)
-
-Full GM MIDI rendering with 128-program sound set:
-
-- [Greatest Love of All](demo/Greatest-Love-Of-All-1.wav)
+https://github.com/knoguchi/dx7/raw/main/demo/epiano1_intro_demo.mp4
 
 ## Structure
 
@@ -47,7 +43,7 @@ Keyboard controls:
 ### Load patches from SysEx
 
 ```
-cargo run --release --package dx7-app -- --sysex sysex/rom1a.syx --patch 0
+cargo run --release --package dx7-app -- --sysex sysex/factory/rom1a.syx --patch 0
 ```
 
 ### Render a single note to WAV
@@ -59,7 +55,7 @@ cargo run --release --package dx7-app -- --render output.wav --note 60 --velocit
 ### Render a MIDI file to WAV
 
 ```
-cargo run --release --package dx7-app -- --midi-file song.mid --sysex sysex/rom1a.syx --patch 3 --render output.wav
+cargo run --release --package dx7-app -- --midi-file song.mid --sysex sysex/factory/rom1a.syx --patch 3 --render output.wav
 ```
 
 ### GM mode
@@ -78,14 +74,13 @@ Use `--track 1 --track 2` to render specific tracks only.
 cargo run --release --package dx7-app -- --list-midi
 ```
 
-## Factory ROMs
+## SysEx Banks
 
-The `sysex/` directory contains the four official DX7 factory ROM banks:
+The `sysex/` directory contains DX7 patch banks organized by source:
 
-- `rom1a.syx` — ROM1A (also compiled into dx7-core as built-in presets)
-- `rom1b.syx` — ROM1B
-- `rom2a.syx` — ROM2A
-- `rom2b.syx` — ROM2B
+- `factory/` — 8 official factory ROM banks (ROM1A–ROM4B)
+- `vrc/` — 24 Voice ROM Cartridge banks (VRC101–VRC112)
+- `greymatter/` — Grey Matter E! expansion banks
 
 ## Engine
 
