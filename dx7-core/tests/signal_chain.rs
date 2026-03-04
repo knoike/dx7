@@ -151,7 +151,7 @@ mod operator_tests {
         // Generate one block at A440 with full gain (MkI: 0 = no attenuation)
         let logfreq = tables::midinote_to_logfreq(69);
         let freq = tables::freqlut_lookup(logfreq);
-        let gain: u16 = 0; // Full gain (MkI log attenuation: 0 = loudest)
+        let gain: i32 = 0; // Full gain (MkI log attenuation: 0 = loudest)
         let mut output = [0i32; N];
 
         operator::compute_pure(&mut output, 0, freq, gain, gain, false);
@@ -177,7 +177,7 @@ mod operator_tests {
         ensure_init();
         let logfreq = tables::midinote_to_logfreq(69);
         let freq = tables::freqlut_lookup(logfreq);
-        let gain: u16 = 0;
+        let gain: i32 = 0;
         let mut output = [0i32; N];
 
         // Fill with a known value
@@ -202,7 +202,7 @@ mod operator_tests {
         ensure_init();
         let logfreq = tables::midinote_to_logfreq(69);
         let freq = tables::freqlut_lookup(logfreq);
-        let gain: u16 = 0;
+        let gain: i32 = 0;
 
         // Pure sine
         let mut pure_out = [0i32; N];
@@ -234,7 +234,7 @@ mod operator_tests {
         // A constant modulation input should shift the carrier's phase.
         let logfreq = tables::midinote_to_logfreq(69);
         let freq = tables::freqlut_lookup(logfreq);
-        let gain: u16 = 0;
+        let gain: i32 = 0;
 
         // Quarter-cycle DC offset
         let dc_value = 1 << 22; // quarter of 2^24 = quarter cycle
@@ -264,7 +264,7 @@ mod operator_tests {
         ensure_init();
         let logfreq = tables::midinote_to_logfreq(69);
         let freq = tables::freqlut_lookup(logfreq);
-        let gain: u16 = 0;
+        let gain: i32 = 0;
         let mut fb_buf = [0i32; 2];
         let fb_shift = 2; // Strong feedback
 
@@ -289,7 +289,7 @@ mod operator_tests {
         ensure_init();
         let logfreq = tables::midinote_to_logfreq(69);
         let freq = tables::freqlut_lookup(logfreq);
-        let gain: u16 = 0;
+        let gain: i32 = 0;
 
         // fb_shift=16 means minimal feedback (shift very far right).
         // MkI output peaks at ~2^26 so even tiny residual feedback
@@ -1013,7 +1013,7 @@ mod fm_depth_tests {
         let sample_rate = 44100.0;
         let logfreq = tables::midinote_to_logfreq(69); // A4 = 440 Hz
         let freq = tables::freqlut_lookup(logfreq);
-        let gain: u16 = 0; // Full gain (MkI: 0 = no attenuation)
+        let gain: i32 = 0; // Full gain (MkI: 0 = no attenuation)
 
         // Step 1: Generate modulator output (pure sine)
         let num_blocks = 200;

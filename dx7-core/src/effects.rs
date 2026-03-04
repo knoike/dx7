@@ -306,7 +306,8 @@ impl Chorus {
 /// DC-blocking high-pass filter (two cascaded 1st-order stages).
 ///
 /// FM synthesis produces time-varying DC offset from asymmetric modulation.
-/// Two stages give fast DC tracking while preserving bass down to ~40 Hz.
+/// Default cutoff 5 Hz matches DX7 hardware coupling capacitor behavior:
+/// -0.5 dB at 16 Hz, -0.1 dB at 33 Hz, preserving all audible bass.
 pub struct DcBlocker {
     // Stage 1
     x1a: f64,
@@ -319,9 +320,13 @@ pub struct DcBlocker {
 
 impl DcBlocker {
     pub fn new(sample_rate: f64) -> Self {
-        // Per-stage cutoff ~20 Hz.  Two cascaded stages give -6 dB at 20 Hz,
-        // -1.5 dB at 65 Hz (C2), which is acceptable for bass.
-        let r = 1.0 - (2.0 * std::f64::consts::PI * 20.0 / sample_rate);
+        Self::with_cutoff(sample_rate, 5.0)
+    }
+
+    /// Create a DC blocker with a custom cutoff frequency in Hz.
+    /// Lower cutoff preserves more bass but tracks DC slower.
+    pub fn with_cutoff(sample_rate: f64, cutoff_hz: f64) -> Self {
+        let r = 1.0 - (2.0 * std::f64::consts::PI * cutoff_hz / sample_rate);
         Self { x1a: 0.0, y1a: 0.0, x1b: 0.0, y1b: 0.0, r }
     }
 

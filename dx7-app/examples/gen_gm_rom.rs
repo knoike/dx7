@@ -167,24 +167,34 @@ fn make_bass_op(level: u8, coarse: u8, rates: [u8;4], levels: [u8;4], kvs: u8) -
 }
 
 fn gm_bass_patch() -> DxVoice {
+    // Thick FM bass using algorithm 5 (three modulator→carrier pairs)
+    // Op2→Op1: main bass body (mod ratio 1, carrier ratio 1, high index)
+    // Op4→Op3: sub-harmonic weight (mod ratio 3, carrier ratio 1)
+    // Op6→Op5: attack transient (fast decay modulator for pluck/punch)
     let ops = [
-        make_bass_op(90, 1, [99,80,70,55], [99,92,88,0], 2),
-        make_bass_op(99, 1, [99,80,70,55], [99,92,88,0], 2),
-        make_bass_op(88, 2, [99,80,70,55], [99,88,82,0], 2),
-        make_bass_op(99, 1, [99,80,70,55], [99,92,88,0], 2),
-        make_bass_op(78, 3, [99,80,70,55], [99,85,78,0], 0),
-        make_bass_op(99, 1, [99,80,70,55], [99,92,88,0], 2),
+        // Op1 (carrier): fundamental body — ratio 1, high level
+        make_bass_op(99, 1, [99,75,60,45], [99,97,92,0], 2),
+        // Op2 (modulator→Op1): ratio 1, high level for rich harmonics
+        make_bass_op(95, 1, [99,80,65,50], [99,90,80,0], 2),
+        // Op3 (carrier): second body layer — ratio 1
+        make_bass_op(90, 1, [99,75,60,45], [99,96,90,0], 2),
+        // Op4 (modulator→Op3): ratio 3 for odd-harmonic FM spectrum
+        make_bass_op(88, 3, [99,82,68,52], [99,85,72,0], 1),
+        // Op5 (carrier): attack layer — ratio 1, moderate level
+        make_bass_op(82, 1, [99,90,50,40], [99,70,0,0], 3),
+        // Op6 (modulator→Op5): ratio 2, fast decay = percussive click
+        make_bass_op(99, 2, [99,99,70,45], [99,0,0,0], 3),
     ];
     DxVoice {
         operators: ops,
         pitch_eg: EnvParams { rates: [99,99,99,99], levels: [50,50,50,50] },
-        algorithm: 4,
-        feedback: 6,
+        algorithm: 4,   // algorithm 5: three pairs (2→1, 4→3, 6→5), fb on 6
+        feedback: 7,     // max feedback on op6 for gritty attack
         osc_key_sync: true,
         lfo: LfoParams::default(),
         pitch_mod_sensitivity: 0,
-        transpose: 36,
-        name: *b"FM BASS   ",
+        transpose: 24,
+        name: *b"FM BASS 2 ",
     }
 }
 
@@ -207,8 +217,13 @@ fn main() {
         }
     }
 
-    // Override bass (32-39) with custom patch
-    let bass = gm_bass_patch();
+    // Override bass (32-39) with factory BASS 1 (rom1a:14)
+    let bass_bank = cache.entry("factory/rom1a.syx").or_insert_with(|| {
+        let path = format!("{}/factory/rom1a.syx", sysex_dir);
+        let data = fs::read(&path).unwrap();
+        DxVoice::parse_bulk_dump(&data).unwrap()
+    });
+    let bass = bass_bank[14].clone();
     for prog in 32..=39usize {
         patches[prog] = bass.clone();
     }

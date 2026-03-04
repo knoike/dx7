@@ -4,6 +4,20 @@ use crate::envelope::EnvParams;
 use crate::lfo::{LfoParams, LfoWaveform};
 use crate::operator::{OperatorParams, ScalingCurve};
 
+/// Normalize a SysEx parameter value to its valid range.
+/// Matches Dexed's `normparm()`: values within range pass through,
+/// out-of-range values are rescaled from 0-255 to 0-max.
+/// Note: Dexed has a bug where memcpy overwrites normparm'd operator params,
+/// so operator EG rates/levels/depths are NOT actually normalized in Dexed.
+/// We apply normparm to global params (pitch EG, algorithm) where Dexed does too.
+fn normparm(value: u8, max: u8) -> u8 {
+    if value <= max {
+        value
+    } else {
+        (value as u16 * max as u16 / 255) as u8
+    }
+}
+
 /// Complete DX7 voice parameters.
 #[derive(Clone, Debug)]
 pub struct DxVoice {
@@ -204,6 +218,61 @@ impl DxVoice {
         d
     }
 
+    /// Convert to Dexed VMEM (unpacked) format: 156 bytes.
+    /// 6 operators × 21 bytes + 30 global bytes.
+    /// Op order: index 0 = OP6, index 5 = OP1 (same as MSFA convention).
+    pub fn to_unpacked(&self) -> [u8; 156] {
+        let mut d = [0u8; 156];
+        for i in 0..6 {
+            let op = &self.operators[i];
+            let off = i * 21;
+            d[off]      = op.eg.rates[0];
+            d[off + 1]  = op.eg.rates[1];
+            d[off + 2]  = op.eg.rates[2];
+            d[off + 3]  = op.eg.rates[3];
+            d[off + 4]  = op.eg.levels[0];
+            d[off + 5]  = op.eg.levels[1];
+            d[off + 6]  = op.eg.levels[2];
+            d[off + 7]  = op.eg.levels[3];
+            d[off + 8]  = op.kbd_level_scaling_break_point;
+            d[off + 9]  = op.kbd_level_scaling_left_depth;
+            d[off + 10] = op.kbd_level_scaling_right_depth;
+            d[off + 11] = op.kbd_level_scaling_left_curve.to_u8();
+            d[off + 12] = op.kbd_level_scaling_right_curve.to_u8();
+            d[off + 13] = op.kbd_rate_scaling;
+            d[off + 14] = op.amp_mod_sensitivity;
+            d[off + 15] = op.key_velocity_sensitivity;
+            d[off + 16] = op.output_level;
+            d[off + 17] = op.osc_mode;
+            d[off + 18] = op.osc_freq_coarse;
+            d[off + 19] = op.osc_freq_fine;
+            d[off + 20] = op.osc_detune;
+        }
+        // Pitch EG
+        d[126] = self.pitch_eg.rates[0];
+        d[127] = self.pitch_eg.rates[1];
+        d[128] = self.pitch_eg.rates[2];
+        d[129] = self.pitch_eg.rates[3];
+        d[130] = self.pitch_eg.levels[0];
+        d[131] = self.pitch_eg.levels[1];
+        d[132] = self.pitch_eg.levels[2];
+        d[133] = self.pitch_eg.levels[3];
+        // Global
+        d[134] = self.algorithm;
+        d[135] = self.feedback;
+        d[136] = if self.osc_key_sync { 1 } else { 0 };
+        d[137] = self.lfo.speed;
+        d[138] = self.lfo.delay;
+        d[139] = self.lfo.pitch_mod_depth;
+        d[140] = self.lfo.amp_mod_depth;
+        d[141] = if self.lfo.key_sync { 1 } else { 0 };
+        d[142] = self.lfo.waveform.to_u8();
+        d[143] = self.pitch_mod_sensitivity;
+        d[144] = self.transpose;
+        d[145..155].copy_from_slice(&self.name);
+        d
+    }
+
     /// Parse a single voice from packed format (128 bytes per voice in bulk dump).
     pub fn from_packed(data: &[u8; 128]) -> Self {
         let mut ops = [OperatorParams::default(); 6];
@@ -213,38 +282,50 @@ impl DxVoice {
             let op_idx = i; // index 0 = OP6, index 5 = OP1
             let base = i * 17;
 
+            // Operator bytes 0-10 pass through with 7-bit mask (matching Dexed's
+            // memcpy that overwrites normparm'd values — see Dexed issue #215).
             let eg = EnvParams {
-                rates: [data[base], data[base + 1], data[base + 2], data[base + 3]],
-                levels: [data[base + 4], data[base + 5], data[base + 6], data[base + 7]],
+                rates: [
+                    data[base] & 0x7F,
+                    data[base + 1] & 0x7F,
+                    data[base + 2] & 0x7F,
+                    data[base + 3] & 0x7F,
+                ],
+                levels: [
+                    data[base + 4] & 0x7F,
+                    data[base + 5] & 0x7F,
+                    data[base + 6] & 0x7F,
+                    data[base + 7] & 0x7F,
+                ],
             };
 
-            let bp = data[base + 8];
-            let ld = data[base + 9];
-            let rd = data[base + 10];
+            let bp = data[base + 8] & 0x7F;
+            let ld = data[base + 9] & 0x7F;
+            let rd = data[base + 10] & 0x7F;
 
             // Byte 11: left_curve[1:0] | right_curve[3:2]
-            let curves = data[base + 11];
+            let curves = data[base + 11] & 0x0F;
             let left_curve = ScalingCurve::from_u8(curves & 0x03);
             let right_curve = ScalingCurve::from_u8((curves >> 2) & 0x03);
 
             // Byte 12: rate_scaling[2:0] | detune[6:3]
-            let rs_det = data[base + 12];
+            let rs_det = data[base + 12] & 0x7F;
             let rate_scaling = rs_det & 0x07;
             let detune = (rs_det >> 3) & 0x0F;
 
             // Byte 13: amp_mod_sens[1:0] | key_vel_sens[4:2]
-            let ams_kvs = data[base + 13];
+            let ams_kvs = data[base + 13] & 0x1F;
             let amp_mod_sensitivity = ams_kvs & 0x03;
             let key_velocity_sensitivity = (ams_kvs >> 2) & 0x07;
 
-            let output_level = data[base + 14];
+            let output_level = data[base + 14] & 0x7F;
 
             // Byte 15: osc_mode[0] | freq_coarse[5:1]
-            let mode_coarse = data[base + 15];
+            let mode_coarse = data[base + 15] & 0x3F;
             let osc_mode = mode_coarse & 0x01;
             let freq_coarse = (mode_coarse >> 1) & 0x1F;
 
-            let freq_fine = data[base + 16];
+            let freq_fine = data[base + 16] & 0x7F;
 
             ops[op_idx] = OperatorParams {
                 eg,
@@ -282,23 +363,34 @@ impl DxVoice {
 
         DxVoice {
             operators: ops,
+            // Pitch EG: normparm to 99 (Dexed does apply this)
             pitch_eg: EnvParams {
-                rates: [data[gb], data[gb + 1], data[gb + 2], data[gb + 3]],
-                levels: [data[gb + 4], data[gb + 5], data[gb + 6], data[gb + 7]],
+                rates: [
+                    normparm(data[gb] & 0x7F, 99),
+                    normparm(data[gb + 1] & 0x7F, 99),
+                    normparm(data[gb + 2] & 0x7F, 99),
+                    normparm(data[gb + 3] & 0x7F, 99),
+                ],
+                levels: [
+                    normparm(data[gb + 4] & 0x7F, 99),
+                    normparm(data[gb + 5] & 0x7F, 99),
+                    normparm(data[gb + 6] & 0x7F, 99),
+                    normparm(data[gb + 7] & 0x7F, 99),
+                ],
             },
             algorithm,
             feedback,
             osc_key_sync,
             lfo: LfoParams {
-                speed: data[gb + 10],
-                delay: data[gb + 11],
-                pitch_mod_depth: data[gb + 12],
-                amp_mod_depth: data[gb + 13],
+                speed: normparm(data[gb + 10], 99),
+                delay: normparm(data[gb + 11], 99),
+                pitch_mod_depth: normparm(data[gb + 12], 99),
+                amp_mod_depth: normparm(data[gb + 13], 99),
                 key_sync: lfo_key_sync,
                 waveform: lfo_waveform,
             },
             pitch_mod_sensitivity,
-            transpose: data[gb + 15],
+            transpose: normparm(data[gb + 15], 48),
             name: {
                 let mut name = [b' '; 10];
                 let name_start = gb + 16;
@@ -368,10 +460,22 @@ impl DxVoice {
 
         Ok(voices)
     }
+
+    /// Raw packed 128 bytes of "Flunk bass" (voice 25 from vrc107b.syx).
+    pub const FLUNK_BASS_PACKED: [u8; 128] = [
+        0x62, 0x62, 0x3E, 0x62, 0x63, 0x63, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3C, 0x14, 0x63, 0x0C,
+        0x00, 0x62, 0x62, 0x26, 0x62, 0x63, 0x63, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3D, 0x1C, 0x46,
+        0x12, 0x00, 0x3B, 0x62, 0x29, 0x47, 0x63, 0x63, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x35, 0x1C,
+        0x3F, 0x12, 0x00, 0x3B, 0x62, 0x62, 0x47, 0x63, 0x63, 0x63, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3D,
+        0x00, 0x4B, 0x00, 0x00, 0x3B, 0x62, 0x16, 0x47, 0x7F, 0x56, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x25, 0x14, 0x48, 0x02, 0x00, 0x62, 0x40, 0x21, 0x47, 0x63, 0x56, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x08, 0x08, 0x63, 0x02, 0x00, 0x62, 0x62, 0x62, 0x62, 0x32, 0x32, 0x32, 0x32, 0x10, 0x0F,
+        0x23, 0x00, 0x00, 0x00, 0x31, 0x0C, 0x46, 0x6C, 0x75, 0x6E, 0x6B, 0x20, 0x62, 0x61, 0x73, 0x73,
+    ];
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -409,5 +513,85 @@ mod tests {
         // OP6 data is at index 0 (first in data = index 0)
         assert_eq!(voice.operators[0].eg.rates[0], 50); // OP6
         assert_eq!(voice.operators[0].output_level, 80);
+    }
+
+    #[test]
+    fn test_flunk_bass_from_packed() {
+        let v = DxVoice::from_packed(&DxVoice::FLUNK_BASS_PACKED);
+
+        assert_eq!(v.name_str(), "Flunk bass");
+        assert_eq!(v.algorithm, 16, "Algorithm 17 (0-indexed 16)");
+        assert_eq!(v.feedback, 7);
+        assert!(v.osc_key_sync);
+        assert_eq!(v.transpose, 12);
+
+        // OP1 (index 5): carrier, OL=99, coarse=1, fine=0, detune=1, KVS=2
+        let op1 = &v.operators[5];
+        assert_eq!(op1.output_level, 99);
+        assert_eq!(op1.osc_freq_coarse, 1);
+        assert_eq!(op1.osc_freq_fine, 0);
+        assert_eq!(op1.osc_detune, 1);
+        assert_eq!(op1.key_velocity_sensitivity, 2);
+        assert_eq!(op1.osc_mode, 0);
+        assert_eq!(op1.eg.rates, [98, 64, 33, 71]);
+        assert_eq!(op1.eg.levels, [99, 86, 0, 0]);
+
+        // OP2 (index 4): modulator, OL=72, coarse=1
+        let op2 = &v.operators[4];
+        assert_eq!(op2.output_level, 72);
+        assert_eq!(op2.osc_freq_coarse, 1);
+        assert_eq!(op2.key_velocity_sensitivity, 5);
+        assert_eq!(op2.eg.levels, [127, 86, 0, 0]);
+
+        // OP3 (index 3): modulator, OL=75, coarse=0 (sub-octave 0.5x)
+        let op3 = &v.operators[3];
+        assert_eq!(op3.output_level, 75);
+        assert_eq!(op3.osc_freq_coarse, 0);
+        assert_eq!(op3.osc_detune, 7);
+        assert_eq!(op3.eg.levels, [99, 99, 99, 0]);
+
+        // OP6 (index 0): feedback source, OL=99, coarse=6
+        let op6 = &v.operators[0];
+        assert_eq!(op6.output_level, 99);
+        assert_eq!(op6.osc_freq_coarse, 6);
+        assert_eq!(op6.key_velocity_sensitivity, 5);
+        assert_eq!(op6.kbd_rate_scaling, 4);
+
+        // OP5 (index 1): OL=70, coarse=9
+        assert_eq!(v.operators[1].output_level, 70);
+        assert_eq!(v.operators[1].osc_freq_coarse, 9);
+
+        // OP4 (index 2): OL=63, coarse=9
+        assert_eq!(v.operators[2].output_level, 63);
+        assert_eq!(v.operators[2].osc_freq_coarse, 9);
+
+        // LFO
+        assert_eq!(v.lfo.speed, 35);
+        assert_eq!(v.lfo.delay, 0);
+        assert_eq!(v.pitch_mod_sensitivity, 3);
+    }
+
+    #[test]
+    fn test_packed_roundtrip() {
+        // Parse Flunk bass, re-pack, re-parse, compare
+        let v1 = DxVoice::from_packed(&DxVoice::FLUNK_BASS_PACKED);
+        let packed = v1.to_packed();
+        let v2 = DxVoice::from_packed(&packed);
+
+        assert_eq!(v2.name_str(), v1.name_str());
+        assert_eq!(v2.algorithm, v1.algorithm);
+        assert_eq!(v2.feedback, v1.feedback);
+        assert_eq!(v2.osc_key_sync, v1.osc_key_sync);
+        assert_eq!(v2.transpose, v1.transpose);
+        for i in 0..6 {
+            assert_eq!(v2.operators[i].output_level, v1.operators[i].output_level,
+                "OP{} output_level mismatch", 6 - i);
+            assert_eq!(v2.operators[i].osc_freq_coarse, v1.operators[i].osc_freq_coarse,
+                "OP{} freq_coarse mismatch", 6 - i);
+            assert_eq!(v2.operators[i].osc_detune, v1.operators[i].osc_detune,
+                "OP{} detune mismatch", 6 - i);
+            assert_eq!(v2.operators[i].key_velocity_sensitivity, v1.operators[i].key_velocity_sensitivity,
+                "OP{} KVS mismatch", 6 - i);
+        }
     }
 }

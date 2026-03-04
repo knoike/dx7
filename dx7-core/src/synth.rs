@@ -217,15 +217,18 @@ impl Synth {
             }
 
             // Convert i32 mix to f32 stereo output
-            // MkI output peaks at ~2^26 per carrier. The >>4 above brings it
-            // to ~2^22, and the /2^24 below gives final float scaling.
+            // Matches Dexed: val >> 4 (done above), clip at ±(1<<24), >> 9, /32768
             let volume = self.master_volume * self.expression;
             for i in 0..block_frames {
-                let sample_i32 = self.mix_buffer[i];
-                // Scale from Q24 to -1.0..1.0 range
-                // With up to 6 carriers, max could be ~6 * (1<<24).
-                // Using (1<<24) as unity gives reasonable headroom.
-                let sample_f32 = (sample_i32 as f64 / (1i64 << 24) as f64) as f32 * volume;
+                let val = self.mix_buffer[i];
+                let clip_val: i32 = if val < -(1 << 24) {
+                    -0x8000
+                } else if val >= (1 << 24) {
+                    0x7FFF
+                } else {
+                    val >> 9
+                };
+                let sample_f32 = (clip_val as f32 / 0x8000 as f32) * volume;
                 let clamped = sample_f32.clamp(-1.0, 1.0);
                 let out_idx = (frame_offset + i) * channels;
                 output[out_idx] = clamped;
@@ -275,10 +278,19 @@ impl Synth {
                 }
             }
 
-            // Convert full block to f32
+            // Convert full block to f32 (matches Dexed PluginProcessor.cpp lines 268-272)
+            // val >> 4 already done above; now clip to 24-bit, shift >> 9, normalize to float
             let mut block_f32 = [0.0f32; N];
             for i in 0..N {
-                block_f32[i] = (self.mix_buffer[i] as f64 / (1i64 << 24) as f64) as f32 * volume;
+                let val = self.mix_buffer[i];
+                let clip_val: i32 = if val < -(1 << 24) {
+                    -0x8000
+                } else if val >= (1 << 24) {
+                    0x7FFF
+                } else {
+                    val >> 9
+                };
+                block_f32[i] = (clip_val as f32 / 0x8000 as f32) * volume;
             }
 
             let remaining = num_frames - frame_offset;

@@ -176,6 +176,17 @@ fn render_wav(output_path: &str, patch: &DxVoice, args: &Args) {
     let mut dc = dx7_core::effects::DcBlocker::new(sample_rate as f64);
     dc.process(&mut all_samples);
 
+    // Normalize to -1 dB peak (matches professional headroom)
+    let peak = all_samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+    if peak > 0.0 {
+        let target = 0.891; // -1 dB
+        let gain = target / peak;
+        for s in all_samples.iter_mut() {
+            *s *= gain;
+        }
+        println!("Normalized: peak {:.4} → {:.4} (gain {:.1}x)", peak, target, gain);
+    }
+
     let spec = hound::WavSpec {
         channels: 1,
         sample_rate,
@@ -794,12 +805,6 @@ fn render_midi_file(midi_path: &str, output_path: &str, patch: &DxVoice, patches
 
     let num = left_samples.len();
 
-    // Apply DX7-style output low-pass filter
-    let mut lpf_l = dx7_core::effects::LowPassFilter4::new(sample_rate as f64, 10500.0);
-    let mut lpf_r = dx7_core::effects::LowPassFilter4::new(sample_rate as f64, 10500.0);
-    lpf_l.process(&mut left_samples);
-    lpf_r.process(&mut right_samples);
-
     // Apply soft saturation for analog warmth
     for s in left_samples.iter_mut() {
         *s = dx7_core::effects::soft_saturate(*s);
@@ -844,7 +849,7 @@ fn render_midi_file(midi_path: &str, output_path: &str, patch: &DxVoice, patches
     let mut tremolo = dx7_core::effects::StereoTremolo::new(
         sample_rate as f64,
         3.5,   // rate Hz — moderate pulse
-        0.35,  // depth — tasteful AM modulation
+        0.12,  // depth — gentle for full mix
     );
     tremolo.process_stereo(&mut left, &mut right);
 
