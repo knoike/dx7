@@ -72,6 +72,11 @@ struct Args {
     #[arg(long = "ch", value_name = "CHn=FILE:VOICE[@VOL[,REV]]")]
     channel_map: Vec<String>,
 
+    /// Disable effects chain (reverb, chorus, tremolo, exciter, widener, saturation)
+    /// for dry output comparable to Dexed
+    #[arg(long)]
+    dry: bool,
+
     /// Enable General MIDI sound set (maps program changes to DX7 patches).
     /// Requires sysex/ directory with factory, vrc, and greymatter banks.
     #[arg(long)]
@@ -111,7 +116,8 @@ fn main() {
     // MIDI file rendering mode
     if let Some(ref midi_path) = args.midi_file {
         let output_path = args.render.as_deref().unwrap_or("output.wav");
-        render_midi_file(midi_path, output_path, &initial_patch, &patches, &args);
+        let patch_locked = args.sysex.is_some();
+        render_midi_file(midi_path, output_path, &initial_patch, &patches, patch_locked, &args);
         return;
     }
 
@@ -572,7 +578,7 @@ fn parse_channel_map(entries: &[String]) -> Vec<(usize, DxVoice, f32, f32)> {
     result
 }
 
-fn render_midi_file(midi_path: &str, output_path: &str, patch: &DxVoice, patches: &[DxVoice], args: &Args) {
+fn render_midi_file(midi_path: &str, output_path: &str, patch: &DxVoice, patches: &[DxVoice], patch_locked: bool, args: &Args) {
     let data = std::fs::read(midi_path).expect("Failed to read MIDI file");
     let (division, events) = parse_midi_file(&data, &args.track);
 
@@ -753,7 +759,8 @@ fn render_midi_file(midi_path: &str, output_path: &str, patch: &DxVoice, patches
             }
             MidiEventKind::ProgramChange { program } => {
                 // Skip ProgramChange for channels with --ch overrides
-                if !mapped_channels[ch] {
+                // or when --sysex locks the patch selection
+                if !mapped_channels[ch] && !patch_locked {
                     if let Some(ref gm) = gm_set {
                         // GM mode: map program number to curated DX7 patch
                         if let Some(p) = gm.get(*program) {
@@ -805,28 +812,31 @@ fn render_midi_file(midi_path: &str, output_path: &str, patch: &DxVoice, patches
 
     let num = left_samples.len();
 
-    // Apply soft saturation for analog warmth
-    for s in left_samples.iter_mut() {
-        *s = dx7_core::effects::soft_saturate(*s);
-    }
-    for s in right_samples.iter_mut() {
-        *s = dx7_core::effects::soft_saturate(*s);
-    }
-
-    // Short ambient reverb — adds space without echo
-    // Small room, high damping = early reflections only
-    let mut reverb = dx7_core::Reverb::new(sample_rate as f32);
-    // Lexicon-style hall — large room, very low damping for bright shimmering tail
-    reverb.set_params(0.85, 0.45, 0.7);
-    let mut rev_l = vec![0.0f32; num];
-    let mut rev_r = vec![0.0f32; num];
-    reverb.process_mono_to_stereo(&reverb_send, &mut rev_l, &mut rev_r);
-
     let mut left = left_samples;
     let mut right = right_samples;
-    for i in 0..num {
-        left[i] += rev_l[i] * 0.15;
-        right[i] += rev_r[i] * 0.15;
+
+    if !args.dry {
+        // Apply soft saturation for analog warmth
+        for s in left.iter_mut() {
+            *s = dx7_core::effects::soft_saturate(*s);
+        }
+        for s in right.iter_mut() {
+            *s = dx7_core::effects::soft_saturate(*s);
+        }
+
+        // Short ambient reverb — adds space without echo
+        // Small room, high damping = early reflections only
+        let mut reverb = dx7_core::Reverb::new(sample_rate as f32);
+        // Lexicon-style hall — large room, very low damping for bright shimmering tail
+        reverb.set_params(0.85, 0.45, 0.7);
+        let mut rev_l = vec![0.0f32; num];
+        let mut rev_r = vec![0.0f32; num];
+        reverb.process_mono_to_stereo(&reverb_send, &mut rev_l, &mut rev_r);
+
+        for i in 0..num {
+            left[i] += rev_l[i] * 0.15;
+            right[i] += rev_r[i] * 0.15;
+        }
     }
 
     // Mix dry drums into center
@@ -835,36 +845,38 @@ fn render_midi_file(midi_path: &str, output_path: &str, patch: &DxVoice, patches
         right[i] += drum_samples[i];
     }
 
-    // Stereo chorus — widens the mix
-    let mut chorus = dx7_core::effects::Chorus::new(
-        sample_rate as f64,
-        0.6,   // LFO rate Hz
-        7.0,   // center delay ms
-        0.8,   // depth ms — subtle widening only, no detuning
-        0.45,  // wet mix — stronger stereo spread
-    );
-    chorus.process_stereo_inplace(&mut left, &mut right);
+    if !args.dry {
+        // Stereo chorus — widens the mix
+        let mut chorus = dx7_core::effects::Chorus::new(
+            sample_rate as f64,
+            0.6,   // LFO rate Hz
+            7.0,   // center delay ms
+            0.8,   // depth ms — subtle widening only, no detuning
+            0.45,  // wet mix — stronger stereo spread
+        );
+        chorus.process_stereo_inplace(&mut left, &mut right);
 
-    // Stereo tremolo — AM modulation for the "wow wow" movement
-    let mut tremolo = dx7_core::effects::StereoTremolo::new(
-        sample_rate as f64,
-        3.5,   // rate Hz — moderate pulse
-        0.12,  // depth — gentle for full mix
-    );
-    tremolo.process_stereo(&mut left, &mut right);
+        // Stereo tremolo — AM modulation for the "wow wow" movement
+        let mut tremolo = dx7_core::effects::StereoTremolo::new(
+            sample_rate as f64,
+            3.5,   // rate Hz — moderate pulse
+            0.12,  // depth — gentle for full mix
+        );
+        tremolo.process_stereo(&mut left, &mut right);
 
-    // Exciter — adds harmonic brightness
-    let mut exciter = dx7_core::effects::Exciter::new(
-        sample_rate as f64,
-        3500.0, // HP cutoff for harmonics
-        1.5,    // drive
-        0.08,   // mix — subtle sparkle
-    );
-    exciter.process_stereo(&mut left, &mut right);
+        // Exciter — adds harmonic brightness
+        let mut exciter = dx7_core::effects::Exciter::new(
+            sample_rate as f64,
+            3500.0, // HP cutoff for harmonics
+            1.5,    // drive
+            0.08,   // mix — subtle sparkle
+        );
+        exciter.process_stereo(&mut left, &mut right);
 
-    // Stereo widener — boost the side (L-R) component for wider image
-    let widener = dx7_core::effects::StereoWidener::new(1.8);
-    widener.process_stereo(&mut left, &mut right);
+        // Stereo widener — boost the side (L-R) component for wider image
+        let widener = dx7_core::effects::StereoWidener::new(1.8);
+        widener.process_stereo(&mut left, &mut right);
+    }
 
     // Normalize stereo output to -1 dB headroom
     let peak = left
