@@ -1,7 +1,4 @@
 /target/
-*.mid
-*.wav
-!demo/*.wav
 *.zip
 *.mp3
 *.xlsx
