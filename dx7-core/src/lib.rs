@@ -8,6 +8,7 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
+pub mod generated_tables;
 pub mod tables;
 pub mod envelope;
 pub mod lfo;

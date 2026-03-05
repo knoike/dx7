@@ -3,6 +3,7 @@
 //! Ported from Dexed/MSFA fm_op_kernel.cc and dx7note.cc
 //! (Apache 2.0, Google Inc. / Pascal Gauthier).
 
+use crate::generated_tables;
 use crate::tables::{self, N, LG_N};
 
 // --- Operator parameter types ---
@@ -385,16 +386,12 @@ pub fn osc_freq(midinote: i32, mode: i32, coarse: i32, fine: i32, detune: i32) -
         let mut logfreq = tables::midinote_to_logfreq(midinote);
 
         // Detune (empirically measured from DX7 hardware, matches Dexed dx7note.cc)
-        // detuneRatio = 0.0209 * exp(-0.396 * logfreq/(1<<24)) / 7
-        // delta = detuneRatio * logfreq * (detune - 7)
-        let logfreq_frac = logfreq as f64 / (1i64 << 24) as f64;
-        let detune_ratio = 0.0209 * (-0.396 * logfreq_frac).exp() / 7.0;
-        logfreq += (detune_ratio * logfreq as f64 * (detune - 7) as f64) as i32;
+        // DETUNE_TAB[n] = round(0.0209 * exp(-0.396 * logfreq_frac) / 7.0 * logfreq)
+        logfreq += generated_tables::DETUNE_TAB[midinote as usize] * (detune - 7);
 
         logfreq += COARSEMUL[(coarse & 31) as usize];
         if fine != 0 {
-            // (1 << 24) / log(2) = 24204406.323123
-            logfreq += (24204406.323123 * (1.0 + 0.01 * fine as f64).ln() + 0.5).floor() as i32;
+            logfreq += generated_tables::FINE_TAB[fine as usize];
         }
         logfreq
     } else {

@@ -4,6 +4,7 @@
 //! (Apache 2.0, Google Inc. / Pascal Gauthier).
 
 use crate::envelope::{self, Envelope};
+use crate::generated_tables;
 use crate::lfo::Lfo;
 use crate::operator::{self, FmOpParams, AMPMODSENSTAB, PITCHMODSENSTAB};
 use crate::patch::DxVoice;
@@ -308,7 +309,11 @@ impl Voice {
 
             if self.ampmodsens[op] != 0 {
                 let sensamp = ((amd_mod as u64 * self.ampmodsens[op] as u64) >> 24) as u32;
-                let pt = ((sensamp as f64 / 262144.0 * 0.07 + 12.2).exp()) as u32;
+                let idx = ((sensamp >> 18) as usize).min(63);
+                let frac = sensamp & 0x3FFFF; // 18-bit fraction
+                let y0 = generated_tables::AMP_MOD_EXP_TAB[idx];
+                let y1 = generated_tables::AMP_MOD_EXP_TAB[idx + 1];
+                let pt = y0 + (((y1 as i64 - y0 as i64) * frac as i64) >> 18) as u32;
                 let ldiff = ((level as u64 * ((pt as u64) << 4)) >> 28) as i32;
                 self.params[op].level_in = level - ldiff;
             } else {

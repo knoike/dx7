@@ -1,5 +1,36 @@
 //! Audio effects: Freeverb-style reverb and soft saturation.
 
+use crate::tables;
+
+/// LFO sine using integer sin_lookup. phase in [0.0, 1.0).
+#[inline]
+fn sin_lfo(phase: f64) -> f64 {
+    let q24 = (phase * ((1u32 << 24) as f64)) as i32;
+    tables::sin_lookup(q24) as f64 / ((1i64 << 24) as f64)
+}
+
+/// Sine of angle in radians (for filter coefficients).
+#[inline]
+fn sin_rad(w: f64) -> f64 {
+    let q24 = (w / (2.0 * core::f64::consts::PI) * ((1u32 << 24) as f64)) as i32;
+    tables::sin_lookup(q24) as f64 / ((1i64 << 24) as f64)
+}
+
+/// Cosine of angle in radians.
+#[inline]
+fn cos_rad(w: f64) -> f64 {
+    sin_rad(w + core::f64::consts::FRAC_PI_2)
+}
+
+/// Fast tanh approximation (Pade [2,2]).
+#[inline]
+fn fast_tanh(x: f32) -> f32 {
+    if x > 5.0 { return 1.0; }
+    if x < -5.0 { return -1.0; }
+    let x2 = x * x;
+    x * (27.0 + x2) / (27.0 + 9.0 * x2)
+}
+
 // --- Freeverb-style reverb ---
 // Based on Jezar's Freeverb (public domain).
 
@@ -219,8 +250,8 @@ impl Chorus {
             self.delay_line[self.write_pos] = input[i];
 
             // Two LFOs at opposite phases for stereo
-            let lfo_l = (self.lfo_phase * 2.0 * std::f64::consts::PI).sin();
-            let lfo_r = ((self.lfo_phase + 0.25) * 2.0 * std::f64::consts::PI).sin();
+            let lfo_l = sin_lfo(self.lfo_phase);
+            let lfo_r = sin_lfo(self.lfo_phase + 0.25);
 
             // Compute delay times
             let delay_l = self.center_delay + self.depth * lfo_l;
@@ -255,8 +286,8 @@ impl Chorus {
             let mono = (left[i] + right[i]) * 0.5;
             self.delay_line[self.write_pos] = mono;
 
-            let lfo_l = (self.lfo_phase * 2.0 * std::f64::consts::PI).sin();
-            let lfo_r = ((self.lfo_phase + 0.25) * 2.0 * std::f64::consts::PI).sin();
+            let lfo_l = sin_lfo(self.lfo_phase);
+            let lfo_r = sin_lfo(self.lfo_phase + 0.25);
 
             let delay_l = self.center_delay + self.depth * lfo_l;
             let delay_r = self.center_delay + self.depth * lfo_r;
@@ -326,7 +357,7 @@ impl DcBlocker {
     /// Create a DC blocker with a custom cutoff frequency in Hz.
     /// Lower cutoff preserves more bass but tracks DC slower.
     pub fn with_cutoff(sample_rate: f64, cutoff_hz: f64) -> Self {
-        let r = 1.0 - (2.0 * std::f64::consts::PI * cutoff_hz / sample_rate);
+        let r = 1.0 - (2.0 * core::f64::consts::PI * cutoff_hz / sample_rate);
         Self { x1a: 0.0, y1a: 0.0, x1b: 0.0, y1b: 0.0, r }
     }
 
@@ -366,11 +397,11 @@ pub struct LowPassFilter {
 impl LowPassFilter {
     /// Create a 2nd-order Butterworth LPF at the given cutoff frequency.
     pub fn new(sample_rate: f64, cutoff_hz: f64) -> Self {
-        let w0 = 2.0 * std::f64::consts::PI * cutoff_hz / sample_rate;
-        let cos_w0 = w0.cos();
-        let sin_w0 = w0.sin();
+        let w0 = 2.0 * core::f64::consts::PI * cutoff_hz / sample_rate;
+        let cos_w0 = cos_rad(w0);
+        let sin_w0 = sin_rad(w0);
         // Q = 1/sqrt(2) for Butterworth
-        let alpha = sin_w0 / (2.0 * std::f64::consts::FRAC_1_SQRT_2);
+        let alpha = sin_w0 / (2.0 * core::f64::consts::FRAC_1_SQRT_2);
 
         let b0 = (1.0 - cos_w0) / 2.0;
         let b1 = 1.0 - cos_w0;
@@ -419,9 +450,9 @@ impl LowPassFilter4 {
     pub fn new(sample_rate: f64, cutoff_hz: f64) -> Self {
         // For 4th-order Butterworth, cascade two 2nd-order sections
         // with Q values from Butterworth polynomial
-        let w0 = 2.0 * std::f64::consts::PI * cutoff_hz / sample_rate;
-        let cos_w0 = w0.cos();
-        let sin_w0 = w0.sin();
+        let w0 = 2.0 * core::f64::consts::PI * cutoff_hz / sample_rate;
+        let cos_w0 = cos_rad(w0);
+        let sin_w0 = sin_rad(w0);
 
         // Stage 1: Q = 1/(2*cos(pi/8)) ≈ 0.5412
         let q1 = 0.54119610;
@@ -475,10 +506,10 @@ pub struct HighPassFilter {
 
 impl HighPassFilter {
     pub fn new(sample_rate: f64, cutoff_hz: f64) -> Self {
-        let w0 = 2.0 * std::f64::consts::PI * cutoff_hz / sample_rate;
-        let cos_w0 = w0.cos();
-        let sin_w0 = w0.sin();
-        let alpha = sin_w0 / (2.0 * std::f64::consts::FRAC_1_SQRT_2);
+        let w0 = 2.0 * core::f64::consts::PI * cutoff_hz / sample_rate;
+        let cos_w0 = cos_rad(w0);
+        let sin_w0 = sin_rad(w0);
+        let alpha = sin_w0 / (2.0 * core::f64::consts::FRAC_1_SQRT_2);
 
         let b0 = (1.0 + cos_w0) / 2.0;
         let b1 = -(1.0 + cos_w0);
@@ -530,7 +561,7 @@ impl Exciter {
         for (l, r) in left.iter_mut().zip(right.iter_mut()) {
             let mono = (*l + *r) * 0.5;
             // Soft-clip saturation to generate harmonics
-            let driven = (mono * self.drive).tanh();
+            let driven = fast_tanh(mono * self.drive);
             // High-pass to isolate only the generated harmonics
             let harmonics = self.hpf.process_sample(driven as f64) as f32;
             // Mix back
@@ -556,11 +587,10 @@ impl StereoTremolo {
 
     pub fn process_stereo(&mut self, left: &mut [f32], right: &mut [f32]) {
         let inc = self.rate / self.sample_rate;
-        let two_pi = 2.0 * std::f64::consts::PI;
         for (l, r) in left.iter_mut().zip(right.iter_mut()) {
             // Sine LFO, 90-degree offset between L/R for stereo movement
-            let lfo_l = (self.phase * two_pi).sin() as f32;
-            let lfo_r = ((self.phase + 0.25) * two_pi).sin() as f32;
+            let lfo_l = sin_lfo(self.phase) as f32;
+            let lfo_r = sin_lfo(self.phase + 0.25) as f32;
             // Map LFO (-1..1) to gain (1-depth .. 1)
             let gain_l = 1.0 - self.depth * 0.5 * (1.0 - lfo_l);
             let gain_r = 1.0 - self.depth * 0.5 * (1.0 - lfo_r);

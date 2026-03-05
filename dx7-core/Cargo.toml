@@ -7,3 +7,7 @@ description = "DX7 FM synthesizer engine — platform-independent library"
 [features]
 default = ["std"]
 std = []
+
+[[bin]]
+name = "gen_tables"
+path = "src/bin/gen_tables.rs"
