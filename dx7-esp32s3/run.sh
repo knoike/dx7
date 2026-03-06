@@ -1,7 +1,11 @@
 #!/bin/bash
 set -e
 
-QEMU=~/.espressif/tools/qemu-xtensa/esp_develop_9.0.0_20240606/qemu/bin/qemu-system-xtensa
+# Ensure xtensa GCC is on PATH
+XTENSA_BIN=$(find ~/.rustup/toolchains/esp -name 'xtensa-esp32s3-elf-gcc' -printf '%h' 2>/dev/null)
+[ -n "$XTENSA_BIN" ] && export PATH="$XTENSA_BIN:$PATH"
+
+QEMU=$(find ~/.espressif/tools/qemu-xtensa -name 'qemu-system-xtensa' 2>/dev/null | head -1)
 ELF=target/xtensa-esp32s3-none-elf/release/dx7-esp32s3
 BIN=bin/dx7-esp32s3.bin
 

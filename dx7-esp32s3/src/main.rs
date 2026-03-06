@@ -15,8 +15,9 @@ mod es8311;
 
 const SAMPLE_RATE: u32 = 48000;
 const CPU_HZ: u32 = 240_000_000;
-const CYCLES_PER_SAMPLE: u32 = CPU_HZ / SAMPLE_RATE; // 5442
 const BLOCK_DEADLINE_US: u64 = (N as u64 * 1_000_000) / SAMPLE_RATE as u64;
+#[cfg(feature = "pwm")]
+const CYCLES_PER_SAMPLE: u32 = CPU_HZ / SAMPLE_RATE;
 
 #[inline(always)]
 fn read_ccount() -> u32 {
@@ -25,6 +26,8 @@ fn read_ccount() -> u32 {
     val
 }
 
+#[cfg(feature = "qemu")]
+#[allow(static_mut_refs)]
 fn init_heap() {
     const HEAP_SIZE: usize = 64 * 1024;
     static mut HEAP: [u8; HEAP_SIZE] = [0u8; HEAP_SIZE];
@@ -100,7 +103,6 @@ fn i2s_playback(patch: &dx7_core::DxVoice) {
     use esp_hal::i2c::master::{I2c, Config as I2cConfig};
     use esp_hal::time::Rate;
     use esp_hal::gpio::{Level, Output, OutputConfig};
-    use esp_hal::dma_buffers;
 
     println!("I2S audio via ES8311 (16-bit, {} Hz)", SAMPLE_RATE);
 
@@ -145,6 +147,7 @@ fn i2s_playback(patch: &dx7_core::DxVoice) {
 
     // DMA descriptors (static lifetime)
     static mut TX_DESC: [esp_hal::dma::DmaDescriptor; 8] = [esp_hal::dma::DmaDescriptor::EMPTY; 8];
+    #[allow(static_mut_refs)]
     let tx_descriptors = unsafe { &mut TX_DESC };
 
     let mut i2s_tx = i2s

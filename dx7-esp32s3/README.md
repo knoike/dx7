@@ -2,12 +2,23 @@
 
 Bare-metal DX7 FM synthesizer on ESP32-S3. Uses `dx7-core` for the synth engine — pure integer math, no floating point, no libm.
 
-## Prerequisites
+## Setup
 
-- [Rust ESP toolchain](https://github.com/esp-rs/espup): `espup install`
-- `cargo +esp` must work
-- For QEMU: [Espressif QEMU fork](https://github.com/espressif/qemu)
-- For flashing: `cargo install espflash`
+```bash
+# 1. Install Rust ESP toolchain
+espup install
+
+# 2. Add xtensa GCC to PATH (add to .bashrc / .zshrc)
+XTENSA_BIN=$(find ~/.rustup/toolchains/esp -name 'xtensa-esp32s3-elf-gcc' -printf '%h' 2>/dev/null)
+export PATH="$XTENSA_BIN:$PATH"
+
+# 3. Install flashing tool
+cargo install cargo-binstall
+cargo binstall espflash
+
+# 4. For QEMU (optional): install Espressif QEMU fork
+#    https://github.com/espressif/qemu
+```
 
 ## Build
 

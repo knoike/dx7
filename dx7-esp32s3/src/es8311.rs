@@ -164,6 +164,7 @@ pub fn init(i2c: &mut I2c<'_, Blocking>, mclk_hz: u32, sample_rate: u32) {
 }
 
 /// Set DAC volume. 0x00 = -95.5dB, 0xBF = 0dB, 0xFF = +32dB.
+#[allow(dead_code)]
 pub fn set_volume(i2c: &mut I2c<'_, Blocking>, vol: u8) {
     wreg(i2c, REG32_DAC_VOL, vol);
 }

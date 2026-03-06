@@ -17,8 +17,7 @@ pwm = []
 es8311 = []
 
 [patch.crates-io]
-esp-rom-sys = { path = "/tmp/esp-rom-sys-patched" }
-esp-sync = { path = "/tmp/esp-sync-patched" }
+esp-rom-sys = { path = "patches/esp-rom-sys" }
 
 [profile.release]
 opt-level = 3
