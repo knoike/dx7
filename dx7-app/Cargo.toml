@@ -10,6 +10,7 @@ bluetooth = [
     "bluer", "tokio", "futures",
     "objc2", "objc2-foundation", "objc2-core-bluetooth", "dispatch2",
 ]
+rtp-midi = ["mdns-sd", "hostname"]
 
 [dependencies]
 dx7-core = { path = "../dx7-core", features = ["std"] }
@@ -20,6 +21,8 @@ crossterm = "0.28"
 clap = { version = "4", features = ["derive"] }
 midly = "0.5"
 ringbuf = "0.4"
+mdns-sd = { version = "0.18", optional = true }
+hostname = { version = "0.4", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 bluer = { version = "0.17", features = ["bluetoothd"], optional = true }

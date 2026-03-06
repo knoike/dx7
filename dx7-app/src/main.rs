@@ -13,6 +13,8 @@ mod gm;
 mod gm_rom;
 mod keyboard;
 mod midi;
+#[cfg(feature = "rtp-midi")]
+mod rtpmidi;
 
 use clap::Parser;
 use crossterm::terminal;
@@ -86,6 +88,16 @@ struct Args {
     #[cfg(feature = "bluetooth")]
     #[arg(long)]
     bluetooth: bool,
+
+    /// Enable RTP-MIDI listener (advertises as "DX7" via mDNS)
+    #[cfg(feature = "rtp-midi")]
+    #[arg(long)]
+    rtp_midi: bool,
+
+    /// RTP-MIDI control port (default: 5004, data port = control + 1)
+    #[cfg(feature = "rtp-midi")]
+    #[arg(long, default_value_t = 5004)]
+    rtp_midi_port: u16,
 }
 
 fn main() {
@@ -959,6 +971,25 @@ fn run_interactive(initial_patch: DxVoice, patches: Vec<DxVoice>, args: &Args) {
             }
             Err(e) => {
                 eprintln!("BLE MIDI: Failed to start ({e})");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    #[cfg(feature = "rtp-midi")]
+    let _rtp_handler = if args.rtp_midi {
+        match rtpmidi::RtpMidiHandler::start(Some(args.rtp_midi_port), engine.command_sender()) {
+            Ok(h) => {
+                println!(
+                    "RTP-MIDI: Listening on port {} (mDNS: \"DX7\")",
+                    args.rtp_midi_port
+                );
+                Some(h)
+            }
+            Err(e) => {
+                eprintln!("RTP-MIDI: Failed to start ({e})");
                 None
             }
         }
