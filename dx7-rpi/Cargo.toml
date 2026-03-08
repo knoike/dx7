@@ -1,0 +1,35 @@
+[package]
+name = "dx7-rpi"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dx7-core = { path = "../dx7-core", default-features = false }
+dx7-midi = { path = "../dx7-midi" }
+embassy-rp = { version = "0.4", features = ["rp235xb", "time-driver", "critical-section-impl"] }
+embassy-executor = { version = "0.9", features = ["arch-cortex-m", "executor-thread"] }
+embassy-time = "0.5"
+embassy-futures = "0.1"
+embassy-sync = "0.7"
+embassy-usb = { version = "0.4", optional = true }
+defmt = "1.0"
+defmt-rtt = "1.0"
+panic-probe = { version = "0.3", features = ["print-defmt"] }
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+embedded-alloc = "0.6"
+static_cell = "2.1"
+fixed = { version = "1.28", optional = true }
+# BLE MIDI (future): cyw43, cyw43-pio, cyw43-firmware, trouble-host
+
+[features]
+pwm = []
+i2s = ["dep:fixed"]
+usb-midi = ["dep:embassy-usb"]
+ble-midi = []
+uart-midi = []
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
