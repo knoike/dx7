@@ -12,7 +12,7 @@ use dx7_core::voice::{Voice, VoiceState};
 use dx7_core::load_rom1a_voice;
 use dx7_core::tables::N;
 
-const MAX_VOICES: usize = 6;
+const MAX_VOICES: usize = 8;
 
 const SAMPLE_RATE: u32 = 48000;
 const CPU_HZ: u32 = 200_000_000;
@@ -173,74 +173,145 @@ fn read_cycles() -> u32 {
     unsafe { core::ptr::read_volatile(0xE000_1004 as *const u32) }
 }
 
-// --- Audio ring buffer (core 0 writes, core 1 reads) ---
+// --- DMA-driven PWM audio output (ping-pong, zero CPU) ---
 
 #[cfg(feature = "pwm")]
-mod audio_ring {
-    use core::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
+mod dma_audio {
+    use core::sync::atomic::{AtomicU8, Ordering};
+    use dx7_core::tables::N;
 
-    /// Ring buffer capacity (must be power of 2). 256 samples = 4 blocks of headroom.
-    const RING_SIZE: usize = 256;
-    const RING_MASK: usize = RING_SIZE - 1;
+    /// Ping-pong DMA buffers. Each entry = (duty << 16) for PWM CC channel B.
+    static mut BUF_A: [u32; N] = [512 << 16; N];
+    static mut BUF_B: [u32; N] = [512 << 16; N];
 
-    /// Ring buffer of pre-scaled PWM duty values (0..1023 for 10-bit).
-    static RING: [AtomicU16; RING_SIZE] = {
-        const INIT: AtomicU16 = AtomicU16::new(512);
-        [INIT; RING_SIZE]
-    };
-    static HEAD: AtomicUsize = AtomicUsize::new(0); // written by core 0
-    static TAIL: AtomicUsize = AtomicUsize::new(0); // read by core 1
+    // DMA register addresses (RP2350)
+    const DMA_BASE: u32 = 0x5000_0000;
+    // CH0 registers
+    const CH0_READ_ADDR:   *mut u32 = (DMA_BASE + 0x000) as *mut u32;
+    const CH0_WRITE_ADDR:  *mut u32 = (DMA_BASE + 0x004) as *mut u32;
+    const CH0_TRANS_COUNT: *mut u32 = (DMA_BASE + 0x008) as *mut u32;
+    const CH0_CTRL_TRIG:   *mut u32 = (DMA_BASE + 0x00C) as *mut u32;
+    // CH1 registers (stride = 0x40)
+    const CH1_READ_ADDR:   *mut u32 = (DMA_BASE + 0x040) as *mut u32;
+    const CH1_WRITE_ADDR:  *mut u32 = (DMA_BASE + 0x044) as *mut u32;
+    const CH1_TRANS_COUNT: *mut u32 = (DMA_BASE + 0x048) as *mut u32;
+    const CH1_CTRL_TRIG:   *mut u32 = (DMA_BASE + 0x04C) as *mut u32;
+    const CH1_AL1_CTRL:    *mut u32 = (DMA_BASE + 0x050) as *mut u32;
+    // Interrupt, abort, and timer registers (RP2350: 4 IRQ sets shift timer to 0x440)
+    const DMA_INTR:      *mut u32 = (DMA_BASE + 0x400) as *mut u32;
+    const DMA_INTE0:     *mut u32 = (DMA_BASE + 0x404) as *mut u32;
+    const DMA_TIMER0:    *mut u32 = (DMA_BASE + 0x440) as *mut u32;
+    const DMA_CHAN_ABORT: *mut u32 = (DMA_BASE + 0x474) as *mut u32;
 
-    /// Number of samples available to read.
-    #[inline]
-    pub fn available() -> usize {
-        let h = HEAD.load(Ordering::Acquire);
-        let t = TAIL.load(Ordering::Relaxed);
-        h.wrapping_sub(t) & RING_MASK
+    /// PWM slice 7 CC register (channel B in upper 16 bits).
+    const PWM_CC7: u32 = 0x400A_8000 + 7 * 0x14 + 0x0C;
+
+    // CTRL register (RP2350): EN(0), DATA_SIZE(3:2), INCR_READ(4),
+    //   CHAIN_TO(16:13), TREQ_SEL(22:17)
+    const CTRL_BASE: u32 = (1 << 0)       // EN
+                         | (2 << 2)        // DATA_SIZE = word (32-bit)
+                         | (1 << 4);       // INCR_READ
+    const TREQ_DMA_TIMER0: u32 = 0x3B << 17;
+    const CH0_CTRL_VAL: u32 = CTRL_BASE | (1 << 13) | TREQ_DMA_TIMER0; // CHAIN_TO = CH1
+    const CH1_CTRL_VAL: u32 = CTRL_BASE | (0 << 13) | TREQ_DMA_TIMER0; // CHAIN_TO = CH0
+
+    /// Which buffer is available for filling (0=A, 1=B, 2=none yet).
+    static FILL_WHICH: AtomicU8 = AtomicU8::new(2);
+
+    /// Initialize DMA ping-pong for PWM audio output at 48kHz.
+    /// Both buffers start with silence (duty=512). CH0 starts immediately.
+    #[allow(static_mut_refs)]
+    pub unsafe fn init() {
+        // First: disable INTE0 bits 0-1 so embassy's DMA IRQ handler ignores CH0/CH1.
+        // Embassy init sets INTE0=0xFFFF — we must clear our bits before any DMA activity.
+        let inte = core::ptr::read_volatile(DMA_INTE0);
+        core::ptr::write_volatile(DMA_INTE0, inte & !0x03);
+
+        // Abort any pre-existing activity on CH0/CH1
+        core::ptr::write_volatile(DMA_CHAN_ABORT, 0x03);
+        // Wait for abort to complete (BUSY bits clear)
+        while core::ptr::read_volatile(CH0_CTRL_TRIG) & (1 << 26) != 0 {}
+        while core::ptr::read_volatile(CH1_CTRL_TRIG) & (1 << 26) != 0 {}
+
+        // Clear any pending raw interrupts for CH0/CH1
+        core::ptr::write_volatile(DMA_INTR, 0x03);
+
+        // DMA pace timer 0: 200MHz × 3/12500 = 48000 Hz
+        core::ptr::write_volatile(DMA_TIMER0, (3 << 16) | 12500);
+
+        // CH0: reads BUF_A → writes PWM_CC7, N transfers, chains to CH1
+        core::ptr::write_volatile(CH0_READ_ADDR, BUF_A.as_ptr() as u32);
+        core::ptr::write_volatile(CH0_WRITE_ADDR, PWM_CC7);
+        core::ptr::write_volatile(CH0_TRANS_COUNT, N as u32);
+
+        // CH1: reads BUF_B → writes PWM_CC7, N transfers, chains to CH0
+        core::ptr::write_volatile(CH1_READ_ADDR, BUF_B.as_ptr() as u32);
+        core::ptr::write_volatile(CH1_WRITE_ADDR, PWM_CC7);
+        core::ptr::write_volatile(CH1_TRANS_COUNT, N as u32);
+
+        // Arm CH1 (non-triggering write — waits for chain from CH0)
+        core::ptr::write_volatile(CH1_AL1_CTRL, CH1_CTRL_VAL);
+
+        FILL_WHICH.store(2, Ordering::Release);
+
+        // Start CH0 (writing CTRL_TRIG triggers the first transfer)
+        core::ptr::write_volatile(CH0_CTRL_TRIG, CH0_CTRL_VAL);
     }
 
-    /// Number of free slots for writing.
+    /// Poll DMA completion. Returns true when a buffer is ready for refilling.
+    /// IMPORTANT: Immediately reloads the completed channel's READ_ADDR and
+    /// TRANS_COUNT to prevent runaway chain (TRANS_COUNT=0 → instant completion).
+    /// If the fill is too slow, the channel replays old data instead of crashing.
     #[inline]
-    pub fn free_slots() -> usize {
-        // Keep one slot empty to distinguish full from empty
-        (RING_SIZE - 1) - available()
-    }
-
-    /// Push a block of pre-scaled duty values. Caller must ensure free_slots() >= count.
-    #[inline]
-    pub fn push_block(duties: &[u16]) {
-        let mut h = HEAD.load(Ordering::Relaxed);
-        for &d in duties {
-            RING[h & RING_MASK].store(d, Ordering::Relaxed);
-            h = h.wrapping_add(1);
+    #[allow(static_mut_refs)]
+    pub fn poll_and_check() -> bool {
+        let intr = unsafe { core::ptr::read_volatile(DMA_INTR) };
+        if intr & 0x01 != 0 {
+            // CH0 finished playing BUF_A → immediately reload CH0 so chain is safe
+            unsafe {
+                core::ptr::write_volatile(DMA_INTR, 0x01);
+                core::ptr::write_volatile(CH0_READ_ADDR, BUF_A.as_ptr() as u32);
+                core::ptr::write_volatile(CH0_TRANS_COUNT, N as u32);
+            }
+            FILL_WHICH.store(0, Ordering::Release);
+            true
+        } else if intr & 0x02 != 0 {
+            // CH1 finished playing BUF_B → immediately reload CH1 so chain is safe
+            unsafe {
+                core::ptr::write_volatile(DMA_INTR, 0x02);
+                core::ptr::write_volatile(CH1_READ_ADDR, BUF_B.as_ptr() as u32);
+                core::ptr::write_volatile(CH1_TRANS_COUNT, N as u32);
+            }
+            FILL_WHICH.store(1, Ordering::Release);
+            true
+        } else {
+            false
         }
-        HEAD.store(h, Ordering::Release);
     }
 
-    /// Pop one duty value. Returns 512 (silence) if empty.
-    #[inline]
-    pub fn pop() -> u16 {
-        let t = TAIL.load(Ordering::Relaxed);
-        if t == HEAD.load(Ordering::Acquire) {
-            return 512; // underrun → silence (10-bit center)
-        }
-        let val = RING[t & RING_MASK].load(Ordering::Relaxed);
-        TAIL.store(t.wrapping_add(1), Ordering::Release);
-        val
+    /// Get the buffer that needs filling. Only valid after poll_and_check() returns true.
+    #[allow(static_mut_refs)]
+    pub unsafe fn get_fill_buffer() -> &'static mut [u32; N] {
+        if FILL_WHICH.load(Ordering::Acquire) == 0 { &mut BUF_A } else { &mut BUF_B }
+    }
+
+    /// Signal that the fill buffer has been written.
+    pub fn buffer_filled() {
+        FILL_WHICH.store(2, Ordering::Release);
     }
 }
 
-// --- Multi-core rendering: timer ISR for PWM + parallel voice rendering ---
+// --- Multi-core voice rendering (DMA handles PWM output) ---
 
 #[cfg(all(feature = "usb-midi", feature = "pwm"))]
 mod mc_render {
     use core::sync::atomic::{AtomicBool, Ordering};
     use dx7_core::voice::Voice;
     use dx7_core::tables::N;
-    use super::{MAX_VOICES, audio_ring};
+    use super::MAX_VOICES;
 
     /// Shared voice pool. Core 0 handles all note_on/note_off (when core 1 is idle).
-    /// During render: core 0 renders voices 0..2, core 1 renders voices 2..4.
+    /// During render: core 0 renders voices 0..2, core 1 renders voices 3..5.
     pub static mut VOICES: core::mem::MaybeUninit<[Voice; MAX_VOICES]> =
         core::mem::MaybeUninit::uninit();
     pub static mut VOICE_AGES: [u32; MAX_VOICES] = [0; MAX_VOICES];
@@ -254,84 +325,12 @@ mod mc_render {
     /// Core 1 sets RENDER_DONE=true when finished. Core 0 checks before combining.
     pub static RENDER_DONE: AtomicBool = AtomicBool::new(true);
 
-    // TIMER0 registers (already enabled by embassy for its time driver).
-    // We use ALARM3 which embassy doesn't use.
-    const T0_ALARM3: *mut u32 = (0x400B_0000 + 0x1C) as *mut u32;
-    const T0_TIMERAWL: *const u32 = (0x400B_0000 + 0x28) as *const u32;
-    // RP2350 has PAUSE/LOCKED/SOURCE registers between TIMERAWL and INTR,
-    // shifting interrupt registers compared to RP2040
-    const T0_INTR: *mut u32 = (0x400B_0000 + 0x3C) as *mut u32;
-    const T0_INTE: *mut u32 = (0x400B_0000 + 0x40) as *mut u32;
-
-    // PWM slice 7 channel B compare register
-    const PWM_CC7: *mut u32 = (0x400A_8000 + 7 * 0x14 + 0x0C) as *mut u32;
-
-    // ISR state (only accessed from ISR on core 1 — no sync needed)
-    static mut ISR_FRAC: u32 = 0;
-    static mut ISR_NEXT: u32 = 0;
-
-    // Vector table for core 1 (needs alignment for VTOR)
-    #[repr(C, align(256))]
-    struct VTable([usize; 48]);
-    static mut CORE1_VTABLE: VTable = VTable([0; 48]);
-
-    /// Timer0 Alarm3 ISR: pops one sample from ring buffer, writes PWM duty.
-    /// Runs at 48kHz on core 1 via interrupt.
-    #[allow(static_mut_refs)]
-    unsafe extern "C" fn timer_isr() {
-        // Clear alarm 3 interrupt (write-1-to-clear bit 3)
-        core::ptr::write_volatile(T0_INTR, 1 << 3);
-
-        // Pop sample and write PWM channel B (upper 16 bits of CC register)
-        let duty = audio_ring::pop();
-        let cc = core::ptr::read_volatile(PWM_CC7);
-        core::ptr::write_volatile(PWM_CC7, (cc & 0xFFFF) | ((duty as u32) << 16));
-
-        // Schedule next alarm (fractional 48kHz: 125/6 = 20.8333 us)
-        ISR_FRAC += 125;
-        let advance = ISR_FRAC / 6;
-        ISR_FRAC %= 6;
-        ISR_NEXT = ISR_NEXT.wrapping_add(advance);
-        core::ptr::write_volatile(T0_ALARM3, ISR_NEXT);
-    }
-
-    extern "C" fn default_handler() {
-        loop { cortex_m::asm::nop(); }
-    }
-
-    /// Core 1 entry: sets up timer ISR for PWM output, then renders voices 2..4 on demand.
+    /// Core 1 entry: render voices MAX_VOICES/2..MAX_VOICES on demand.
+    /// DMA handles PWM output — core 1 only renders voices.
     #[allow(static_mut_refs)]
     pub unsafe fn core1_entry() -> ! {
-        // Build vector table for core 1 with our timer ISR
-        let default_addr = default_handler as *const () as usize;
-        for entry in CORE1_VTABLE.0.iter_mut() {
-            *entry = default_addr;
-        }
-        // IRQ 3 = TIMER0_IRQ_3 → vector table index 16 + 3 = 19
-        CORE1_VTABLE.0[16 + 3] = timer_isr as *const () as usize;
-
-        // Set VTOR on core 1 to our table
-        core::ptr::write_volatile(0xE000_ED08 as *mut u32, CORE1_VTABLE.0.as_ptr() as u32);
-
-        // Initialize TIMER0 ALARM3
-        let now = core::ptr::read_volatile(T0_TIMERAWL);
-        ISR_FRAC = 0;
-        ISR_NEXT = now.wrapping_add(21);
-        core::ptr::write_volatile(T0_ALARM3, ISR_NEXT);
-
-        // Enable alarm 3 interrupt (read-modify-write to preserve embassy's alarm bits)
-        let inte = core::ptr::read_volatile(T0_INTE);
-        core::ptr::write_volatile(T0_INTE, inte | (1 << 3));
-
-        // Enable IRQ 3 (TIMER0_IRQ_3) in core 1's NVIC
-        core::ptr::write_volatile(0xE000_E100 as *mut u32, 1 << 3);
-
-        // Ensure interrupts are globally enabled on core 1
-        cortex_m::interrupt::enable();
-
         let voices = VOICES.assume_init_mut();
 
-        // Render loop: wait for signal from core 0, render voices 2..4, signal done
         loop {
             while !RENDER_START.load(Ordering::Acquire) {
                 cortex_m::asm::nop();
@@ -422,38 +421,31 @@ async fn main(_spawner: Spawner) {
     }
 }
 
-// === PWM demo playback (hardcoded note, dual-core) ===
+// === PWM demo playback (hardcoded note, single-core with DMA) ===
 
 #[cfg(all(feature = "pwm", not(feature = "usb-midi")))]
 fn pwm_demo(
     patch: &dx7_core::DxVoice,
     slice: embassy_rp::peripherals::PWM_SLICE7,
     pin: embassy_rp::peripherals::PIN_15,
-    core1: embassy_rp::peripherals::CORE1,
+    _core1: embassy_rp::peripherals::CORE1,
 ) {
     use embassy_rp::pwm::{Config as PwmConfig, Pwm};
 
-    info!("PWM audio on GP15 (dual-core, 10-bit, ~195 kHz carrier)");
+    info!("PWM audio on GP15 (DMA output, 10-bit, ~195 kHz carrier)");
 
-    // Setup PWM on core 0
     let mut config = PwmConfig::default();
     config.top = 1023;
     config.compare_b = 512;
     let _pwm = Pwm::new_output_b(slice, pin, config);
 
-    // Start core 1 for PWM output
-    start_pwm_core1(core1);
-
-    // Pre-fill ring buffer with 2 blocks of silence
-    let silence = [512u16; N];
-    audio_ring::push_block(&silence);
-    audio_ring::push_block(&silence);
+    // Start DMA ping-pong (both buffers initialized to silence)
+    unsafe { dma_audio::init(); }
 
     let mut voice = Voice::new();
     voice.note_on(patch, 60, 100);
     let note_blocks = (SAMPLE_RATE as usize * 2) / N;
     let mut output = [0i32; N];
-    let mut duties = [0u16; N];
 
     info!("Playing {} blocks...", note_blocks);
     for block in 0..note_blocks {
@@ -461,77 +453,37 @@ fn pwm_demo(
         if block == note_blocks / 2 {
             voice.note_off();
         }
-        // Scale output to 10-bit PWM duty (0..1023)
-        for i in 0..N {
-            let duty = (output[i] >> 17) + 512;
-            duties[i] = usat::<10>(duty) as u16;
-        }
-        // Wait for space in ring buffer
-        while audio_ring::free_slots() < N {
+        // Wait for DMA buffer available, then fill it
+        while !dma_audio::poll_and_check() {
             cortex_m::asm::nop();
         }
-        audio_ring::push_block(&duties);
+        unsafe {
+            let buf = dma_audio::get_fill_buffer();
+            for i in 0..N {
+                let duty = (output[i] >> 17) + 512;
+                buf[i] = (usat::<10>(duty) as u32) << 16;
+            }
+            dma_audio::buffer_filled();
+        }
     }
-    // Wait for ring buffer to drain
-    while audio_ring::available() > 0 {
-        cortex_m::asm::nop();
+    // Flush: fill remaining buffers with silence
+    for _ in 0..2 {
+        while !dma_audio::poll_and_check() {
+            cortex_m::asm::nop();
+        }
+        unsafe {
+            let buf = dma_audio::get_fill_buffer();
+            buf.fill(512 << 16);
+            dma_audio::buffer_filled();
+        }
     }
     info!("Playback done.");
 }
 
-// === Core 1: PWM sample output ===
+// === Core 1 stack (used by USB MIDI synth for parallel voice rendering) ===
 
-#[cfg(feature = "pwm")]
+#[cfg(all(feature = "usb-midi", feature = "pwm"))]
 static mut CORE1_STACK: embassy_rp::multicore::Stack<4096> = embassy_rp::multicore::Stack::new();
-
-/// Start core 1 to drain the audio ring buffer to PWM at sample-accurate timing.
-/// PWM must already be configured on core 0 before calling this.
-/// Used by pwm_demo only; USB MIDI synth uses mc_render::core1_entry instead.
-#[cfg(all(feature = "pwm", not(feature = "usb-midi")))]
-fn start_pwm_core1(core1: embassy_rp::peripherals::CORE1) {
-    // Microseconds per sample (integer part). 48kHz = 20.833us per sample.
-    // We alternate 21/21/21/21/20 to average 20.8333 (exact 48kHz over 6 samples).
-    // Pattern: 5 samples at 21us + 1 sample at 16us? No — simpler: use fractional accumulator.
-    const USEC_PER_SAMPLE_X6: u32 = 125; // 125/6 = 20.8333 us exactly (48000 Hz)
-
-    #[allow(static_mut_refs)]
-    unsafe {
-        embassy_rp::multicore::spawn_core1(core1, &mut CORE1_STACK, move || -> ! {
-            // PWM slice 7, channel B compare register (bits 31:16 of CC)
-            // RP2350 PWM base: 0x400A8000, slice stride: 0x14, CC offset: 0x0C
-            let pwm_cc = (0x400A_8000u32 + 7 * 0x14 + 0x0C) as *mut u32;
-
-            // Use RP2350 TIMER0 timerawl (1 MHz, shared between cores)
-            // TIMER0 base: 0x400B0000, timerawl offset: 0x28
-            let timer_raw = 0x400B_0028 as *const u32;
-
-            let mut last_us = core::ptr::read_volatile(timer_raw);
-            // Fractional accumulator: counts in units of 1/6 microsecond
-            // Each sample advances by 125/6 us. We track (last_us * 6 + frac).
-            let mut frac: u32 = 0;
-
-            loop {
-                let duty = audio_ring::pop();
-                // Write channel B compare (upper 16 bits of CC register)
-                let cc = core::ptr::read_volatile(pwm_cc);
-                core::ptr::write_volatile(pwm_cc, (cc & 0xFFFF) | ((duty as u32) << 16));
-
-                // Advance fractional accumulator by 125 (= 20.8333 us * 6)
-                frac += USEC_PER_SAMPLE_X6;
-                let advance_us = frac / 6;
-                frac %= 6;
-                let target = last_us.wrapping_add(advance_us);
-
-                // Busy-wait on shared timer until target time
-                while core::ptr::read_volatile(timer_raw)
-                    .wrapping_sub(target)
-                    > 1_000_000 // guard: if we're within 1 second, we haven't passed yet
-                {}
-                last_us = target;
-            }
-        });
-    }
-}
 
 // === USB MIDI + PWM live synth (dual-core) ===
 
@@ -559,18 +511,13 @@ async fn usb_midi_pwm_synth(
         mc_render::VOICES.write(core::array::from_fn(|_| Voice::new()));
     }
 
-    // Start core 1: timer ISR for PWM output + parallel voice rendering
+    // Start core 1 for parallel voice rendering (DMA handles PWM output)
     #[allow(static_mut_refs)]
     unsafe {
         embassy_rp::multicore::spawn_core1(core1, &mut CORE1_STACK, || -> ! {
             mc_render::core1_entry()
         });
     }
-
-    // Pre-fill ring buffer with 2 blocks of silence
-    let silence = [512u16; N];
-    audio_ring::push_block(&silence);
-    audio_ring::push_block(&silence);
 
     // Setup USB
     let driver = Driver::new(usb_peripheral, Irqs);
@@ -741,7 +688,9 @@ async fn usb_midi_pwm_synth(
         let mut peak_raw: i32 = 0;      // peak |output[i]| over 1 second
         let mut peak_duty_off: u16 = 0; // peak |duty - 128| over 1 second
 
-        info!("USB MIDI ready — dual-core, {} voices", MAX_VOICES);
+        unsafe { dma_audio::init(); }
+
+        info!("USB MIDI ready — dual-core, {} voices, DMA audio", MAX_VOICES);
 
         loop {
             // Drain MIDI queue
@@ -842,9 +791,8 @@ async fn usb_midi_pwm_synth(
                     peak_raw = raw_abs;
                 }
                 // Convert i32 to f32. Single voice peaks ±2^26.
-                // Divide by 2^26 * 2 — loud enough for typical playing,
-                // soft-clip handles occasional peaks from dense chords.
-                let sample_f32 = output[i] as f32 / (67108864.0 * 2.0);
+                // Divide by 2^26 * 3 for 8-voice mix — soft-clip handles peaks.
+                let sample_f32 = output[i] as f32 / (67108864.0 * 3.0);
                 let filtered = filter.process(sample_f32);
                 // Soft clip: tanh approximation (smooth limiting, no harsh distortion)
                 let x = filtered;
@@ -864,11 +812,18 @@ async fn usb_midi_pwm_synth(
                 }
             }
 
-            // Wait for space in ring buffer, yielding to let USB tasks run
-            while audio_ring::free_slots() < N {
+            // Wait for DMA buffer available, yielding to let USB tasks run
+            while !dma_audio::poll_and_check() {
                 embassy_futures::yield_now().await;
             }
-            audio_ring::push_block(&duties);
+            // Fill DMA buffer with rendered duties
+            unsafe {
+                let buf = dma_audio::get_fill_buffer();
+                for i in 0..N {
+                    buf[i] = (duties[i] as u32) << 16;
+                }
+                dma_audio::buffer_filled();
+            }
 
             // Send diagnostics once per second
             block_count += 1;
