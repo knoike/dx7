@@ -8,6 +8,7 @@ use defmt_rtt as _;
 use panic_probe as _;
 
 use embassy_executor::Spawner;
+use embassy_hal_internal::Peri;
 use dx7_core::voice::{Voice, VoiceState};
 use dx7_core::load_rom1a_voice;
 use dx7_core::tables::N;
@@ -303,7 +304,7 @@ mod dma_audio {
 
 // --- Multi-core voice rendering (DMA handles PWM output) ---
 
-#[cfg(all(feature = "usb-midi", feature = "pwm"))]
+#[cfg(all(any(feature = "usb-midi", feature = "ble-midi"), feature = "pwm"))]
 mod mc_render {
     use core::sync::atomic::{AtomicBool, Ordering};
     use dx7_core::voice::Voice;
@@ -354,11 +355,28 @@ mod mc_render {
     }
 }
 
-// --- USB interrupt binding ---
+// --- CYW43 firmware embedding (BLE MIDI) ---
 
-#[cfg(feature = "usb-midi")]
+#[cfg(feature = "ble-midi")]
+mod cyw43_fw {
+    #[repr(C, align(4))]
+    pub struct Aligned<const N: usize>(pub [u8; N]);
+
+    pub static FW: &[u8] = include_bytes!("../cyw43-firmware/43439A0.bin");
+    pub static BTFW: &[u8] = include_bytes!("../cyw43-firmware/43439A0_btfw.bin");
+    pub static CLM: &[u8] = include_bytes!("../cyw43-firmware/43439A0_clm.bin");
+}
+
+// --- Interrupt bindings ---
+
+#[cfg(all(feature = "usb-midi", not(feature = "ble-midi")))]
 embassy_rp::bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => embassy_rp::usb::InterruptHandler<embassy_rp::peripherals::USB>;
+});
+
+#[cfg(feature = "ble-midi")]
+embassy_rp::bind_interrupts!(struct Irqs {
+    PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<embassy_rp::peripherals::PIO0>;
 });
 
 // --- Entry point ---
@@ -402,13 +420,23 @@ async fn main(_spawner: Spawner) {
 
     // === Feature-gated playback ===
 
-    // USB MIDI synth never returns — handle separately to avoid unreachable-code warning
-    #[cfg(all(feature = "usb-midi", feature = "pwm"))]
+    // BLE MIDI synth never returns
+    #[cfg(all(feature = "ble-midi", feature = "pwm"))]
+    ble_midi_pwm_synth(
+        p.PIO0, p.PIN_23, p.PIN_24, p.PIN_25, p.PIN_29,
+        p.DMA_CH2, p.PWM_SLICE7, p.PIN_15, p.CORE1,
+    ).await;
+
+    // USB MIDI synth never returns
+    #[cfg(all(feature = "usb-midi", not(feature = "ble-midi"), feature = "pwm"))]
     usb_midi_pwm_synth(p.USB, p.PWM_SLICE7, p.PIN_15, p.CORE1).await;
 
-    #[cfg(not(all(feature = "usb-midi", feature = "pwm")))]
+    #[cfg(not(any(
+        all(feature = "ble-midi", feature = "pwm"),
+        all(feature = "usb-midi", feature = "pwm"),
+    )))]
     {
-        #[cfg(all(feature = "pwm", not(feature = "usb-midi")))]
+        #[cfg(all(feature = "pwm", not(feature = "usb-midi"), not(feature = "ble-midi")))]
         pwm_demo(&patch, p.PWM_SLICE7, p.PIN_15, p.CORE1);
 
         #[cfg(not(feature = "pwm"))]
@@ -423,12 +451,12 @@ async fn main(_spawner: Spawner) {
 
 // === PWM demo playback (hardcoded note, single-core with DMA) ===
 
-#[cfg(all(feature = "pwm", not(feature = "usb-midi")))]
+#[cfg(all(feature = "pwm", not(feature = "usb-midi"), not(feature = "ble-midi")))]
 fn pwm_demo(
     patch: &dx7_core::DxVoice,
-    slice: embassy_rp::peripherals::PWM_SLICE7,
-    pin: embassy_rp::peripherals::PIN_15,
-    _core1: embassy_rp::peripherals::CORE1,
+    slice: Peri<'static, embassy_rp::peripherals::PWM_SLICE7>,
+    pin: Peri<'static, embassy_rp::peripherals::PIN_15>,
+    _core1: Peri<'static, embassy_rp::peripherals::CORE1>,
 ) {
     use embassy_rp::pwm::{Config as PwmConfig, Pwm};
 
@@ -480,19 +508,19 @@ fn pwm_demo(
     info!("Playback done.");
 }
 
-// === Core 1 stack (used by USB MIDI synth for parallel voice rendering) ===
+// === Core 1 stack (used by USB/BLE MIDI synth for parallel voice rendering) ===
 
-#[cfg(all(feature = "usb-midi", feature = "pwm"))]
+#[cfg(all(any(feature = "usb-midi", feature = "ble-midi"), feature = "pwm"))]
 static mut CORE1_STACK: embassy_rp::multicore::Stack<4096> = embassy_rp::multicore::Stack::new();
 
 // === USB MIDI + PWM live synth (dual-core) ===
 
-#[cfg(all(feature = "usb-midi", feature = "pwm"))]
+#[cfg(all(feature = "usb-midi", not(feature = "ble-midi"), feature = "pwm"))]
 async fn usb_midi_pwm_synth(
-    usb_peripheral: embassy_rp::peripherals::USB,
-    pwm_slice: embassy_rp::peripherals::PWM_SLICE7,
-    pwm_pin: embassy_rp::peripherals::PIN_15,
-    core1: embassy_rp::peripherals::CORE1,
+    usb_peripheral: Peri<'static, embassy_rp::peripherals::USB>,
+    pwm_slice: Peri<'static, embassy_rp::peripherals::PWM_SLICE7>,
+    pwm_pin: Peri<'static, embassy_rp::peripherals::PIN_15>,
+    core1: Peri<'static, embassy_rp::peripherals::CORE1>,
 ) -> ! {
     use embassy_rp::pwm::{Config as PwmConfig, Pwm};
     use embassy_rp::usb::Driver;
@@ -854,5 +882,322 @@ async fn usb_midi_pwm_synth(
 
     // Run all three concurrently on core 0
     embassy_futures::join::join3(usb_run, midi_read, audio_render).await;
+    core::unreachable!()
+}
+
+// === BLE MIDI + PWM live synth (dual-core, CYW43) ===
+
+#[cfg(all(feature = "ble-midi", feature = "pwm"))]
+async fn ble_midi_pwm_synth(
+    pio0: Peri<'static, embassy_rp::peripherals::PIO0>,
+    pin_23: Peri<'static, embassy_rp::peripherals::PIN_23>,
+    pin_24: Peri<'static, embassy_rp::peripherals::PIN_24>,
+    pin_25: Peri<'static, embassy_rp::peripherals::PIN_25>,
+    pin_29: Peri<'static, embassy_rp::peripherals::PIN_29>,
+    dma_ch2: Peri<'static, embassy_rp::peripherals::DMA_CH2>,
+    pwm_slice: Peri<'static, embassy_rp::peripherals::PWM_SLICE7>,
+    pwm_pin: Peri<'static, embassy_rp::peripherals::PIN_15>,
+    core1: Peri<'static, embassy_rp::peripherals::CORE1>,
+) -> ! {
+    use embassy_rp::pwm::{Config as PwmConfig, Pwm};
+    use embassy_rp::gpio::{Level, Output};
+    use embassy_rp::pio::Pio;
+    use trouble_host::prelude::*;
+
+    info!("BLE MIDI synth with PWM output on GP15 (dual-core render)");
+
+    // Setup PWM (10-bit: 200MHz/1024 ≈ 195kHz carrier)
+    let mut pwm_config = PwmConfig::default();
+    pwm_config.top = 1023;
+    pwm_config.compare_b = 512;
+    let _pwm = Pwm::new_output_b(pwm_slice, pwm_pin, pwm_config);
+
+    // Initialize shared voice pool
+    #[allow(static_mut_refs)]
+    unsafe {
+        mc_render::VOICES.write(core::array::from_fn(|_| Voice::new()));
+    }
+
+    // Start core 1 for parallel voice rendering
+    #[allow(static_mut_refs)]
+    unsafe {
+        embassy_rp::multicore::spawn_core1(core1, &mut CORE1_STACK, || -> ! {
+            mc_render::core1_entry()
+        });
+    }
+
+    // --- CYW43 initialization ---
+    let pwr = Output::new(pin_23, Level::Low);
+    let cs = Output::new(pin_25, Level::High);
+    let mut pio = Pio::new(pio0, Irqs);
+    // PIO SPI clock divider: sysclk / divider must be ≤ 50MHz for CYW43.
+    // At 200MHz overclock, divider=4 gives 50MHz SPI.
+    let clock_div = fixed::FixedU32::<fixed::types::extra::U8>::from_num(4);
+    let spi = cyw43_pio::PioSpi::new(
+        &mut pio.common,
+        pio.sm0,
+        clock_div,
+        pio.irq0,
+        cs,
+        pin_24,  // DIO
+        pin_29,  // CLK
+        dma_ch2,
+    );
+
+    static CYW43_STATE: static_cell::StaticCell<cyw43::State> = static_cell::StaticCell::new();
+    let state = CYW43_STATE.init(cyw43::State::new());
+
+    let (_net_device, bt_device, mut control, runner) =
+        cyw43::new_with_bluetooth(state, pwr, spi, cyw43_fw::FW, cyw43_fw::BTFW).await;
+
+    // GATT server with BLE MIDI service (must be defined before async blocks capture references)
+    #[gatt_server]
+    struct MidiServer {
+        midi_svc: MidiSvc,
+    }
+
+    #[gatt_service(uuid = "03B80E5A-EDE8-4B33-A751-6CE34EC4C700")]
+    struct MidiSvc {
+        #[characteristic(uuid = "7772E5DB-3868-4112-A1A9-F2669D106BF3", write_without_response, read, notify)]
+        midi_io: [u8; 20],
+    }
+
+    static MIDI_QUEUE: dx7_midi::MidiQueue = dx7_midi::MidiQueue::new();
+
+    // Task 1: CYW43 background driver (must run continuously)
+    let cyw43_task = runner.run();
+
+    // Task 2+3: Init CYW43, setup BLE, then run BLE + audio concurrently.
+    // control.init() needs the CYW43 runner to be active, so this runs alongside cyw43_task.
+    let ble_and_audio = async {
+        // CYW43 control init (sends ioctls to the runner — runner must be running)
+        control.init(cyw43_fw::CLM).await;
+        control.set_power_management(cyw43::PowerManagementMode::PowerSave).await;
+        // LED on = CYW43 init succeeded (Pico 2 W LED is GPIO0 on CYW43)
+        control.gpio_set(0, true).await;
+        info!("CYW43 initialized with Bluetooth");
+
+        // trouble-host BLE stack
+        let controller: ExternalController<_, 1> = ExternalController::new(bt_device);
+        let address: Address = Address::random([0xD7, 0x07, 0x42, 0x01, 0x02, 0x03]);
+
+        let mut resources: HostResources<DefaultPacketPool, 1, 2> = HostResources::new();
+        let stack = trouble_host::new(controller, &mut resources).set_random_address(address);
+        let Host { mut peripheral, runner: mut ble_runner, .. } = stack.build();
+
+        let server = MidiServer::new_with_config(GapConfig::default("DX7")).unwrap();
+
+        // BLE host stack runner
+        let ble_host_task = ble_runner.run();
+
+        // BLE MIDI advertise + connection handler
+        let ble_task = async {
+            // BLE MIDI service UUID (03B80E5A-EDE8-4B33-A751-6CE34EC4C700) in little-endian
+            const MIDI_SVC_UUID: [u8; 16] = [
+                0x00, 0xC7, 0xC4, 0x4E, 0xE3, 0x6C, 0x51, 0xA7,
+                0x33, 0x4B, 0xE8, 0xED, 0x5A, 0x0E, 0xB8, 0x03,
+            ];
+            loop {
+                let mut adv_buf = [0u8; 31];
+                let adv_len = AdStructure::encode_slice(
+                    &[
+                        AdStructure::Flags(LE_GENERAL_DISCOVERABLE | BR_EDR_NOT_SUPPORTED),
+                        AdStructure::ServiceUuids128(&[MIDI_SVC_UUID]),
+                        AdStructure::CompleteLocalName(b"DX7"),
+                    ],
+                    &mut adv_buf,
+                ).unwrap();
+
+                let adv_data = Advertisement::ConnectableScannableUndirected {
+                    adv_data: &adv_buf[..adv_len],
+                    scan_data: &[],
+                };
+
+                info!("BLE: advertising as 'DX7'...");
+                let advertiser = peripheral.advertise(&Default::default(), adv_data).await.unwrap();
+                let conn = advertiser.accept().await.unwrap();
+                info!("BLE: connected!");
+
+                let gatt_conn = conn.with_attribute_server(&server).unwrap();
+
+                loop {
+                    match gatt_conn.next().await {
+                        GattConnectionEvent::Disconnected { .. } => {
+                            info!("BLE: disconnected");
+                            break;
+                        }
+                        GattConnectionEvent::Gatt { event } => {
+                            match event {
+                                GattEvent::Write(write_evt) => {
+                                    let data = write_evt.data();
+                                    dx7_midi::ble::parse_ble_midi_packet(data, &MIDI_QUEUE);
+                                    let _ = write_evt.accept();
+                                }
+                                other => { let _ = other.accept(); }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        };
+
+        // Audio render loop
+        let audio_render = async {
+        #[allow(static_mut_refs)]
+        let voices = unsafe { mc_render::VOICES.assume_init_mut() };
+        #[allow(static_mut_refs)]
+        let voice_ages = unsafe { &mut mc_render::VOICE_AGES };
+        #[allow(static_mut_refs)]
+        let voice_age = unsafe { &mut mc_render::VOICE_AGE };
+        let mut current_patch = load_rom1a_voice(0).unwrap();
+        let mut output = [0i32; N];
+        let mut duties = [0u16; N];
+        static mut FILTER: OutputFilterF32 = OutputFilterF32 {
+            dc1: DcBlockerF32 { r: 0.9993455, x1: 0.0, y1: 0.0 },
+            dc2: DcBlockerF32 { r: 0.9993455, x1: 0.0, y1: 0.0 },
+            lpf1: BiquadF32 {
+                b0: 0.21113742, b1: 0.42227485, b2: 0.21113742,
+                a1: -0.20469809, a2: 0.04924778,
+                x1: 0.0, x2: 0.0, y1: 0.0, y2: 0.0,
+            },
+            lpf2: BiquadF32 {
+                b0: 0.29262414, b1: 0.58524828, b2: 0.29262414,
+                a1: -0.28369960, a2: 0.45419615,
+                x1: 0.0, x2: 0.0, y1: 0.0, y2: 0.0,
+            },
+        };
+        #[allow(static_mut_refs)]
+        let filter = unsafe { &mut FILTER };
+
+        let budget_cycles = (N as u32 * CPU_HZ) / SAMPLE_RATE;
+        let blocks_per_sec = SAMPLE_RATE / N as u32;
+        let mut block_count: u32 = 0;
+        let mut peak_cycles: u32 = 0;
+
+        unsafe { dma_audio::init(); }
+
+        info!("BLE MIDI ready — dual-core, {} voices, DMA audio", MAX_VOICES);
+
+        loop {
+            // Drain MIDI queue
+            while let Some(msg) = MIDI_QUEUE.pop() {
+                match msg {
+                    dx7_midi::MidiMessage::NoteOn { note, velocity } => {
+                        *voice_age += 1;
+                        let slot = voices.iter().position(|v| v.is_finished())
+                            .or_else(|| {
+                                voices.iter().enumerate()
+                                    .filter(|(_, v)| v.state == VoiceState::Released)
+                                    .min_by_key(|(i, _)| voice_ages[*i])
+                                    .map(|(i, _)| i)
+                            })
+                            .unwrap_or_else(|| {
+                                (0..MAX_VOICES).min_by_key(|&i| voice_ages[i]).unwrap()
+                            });
+                        voices[slot].note_on(&current_patch, note, velocity);
+                        voice_ages[slot] = *voice_age;
+                    }
+                    dx7_midi::MidiMessage::NoteOff { note, .. } => {
+                        for v in voices.iter_mut() {
+                            if v.note == note && !v.is_finished() {
+                                v.note_off();
+                                break;
+                            }
+                        }
+                    }
+                    dx7_midi::MidiMessage::ProgramChange { program } => {
+                        if program == 32 {
+                            current_patch = dx7_core::DxVoice::init_voice();
+                        } else if let Some(p) = load_rom1a_voice(program as usize) {
+                            current_patch = p;
+                        }
+                    }
+                    dx7_midi::MidiMessage::ControlChange { .. } => {}
+                    _ => {}
+                }
+            }
+
+            // Signal core 1 to render voices MAX_VOICES/2..MAX_VOICES
+            mc_render::RENDER_DONE.store(false, core::sync::atomic::Ordering::Relaxed);
+            mc_render::RENDER_START.store(true, core::sync::atomic::Ordering::Release);
+
+            // Render voices 0..MAX_VOICES/2 on core 0
+            output.fill(0);
+            let render_start = read_cycles();
+            for idx in 0..(MAX_VOICES / 2) {
+                if !voices[idx].is_finished() {
+                    let mut voice_buf = [0i32; N];
+                    voices[idx].render(&mut voice_buf);
+                    for i in 0..N {
+                        output[i] = qadd(output[i], voice_buf[i]);
+                    }
+                }
+            }
+            let render_cycles = read_cycles().wrapping_sub(render_start);
+
+            // Wait for core 1
+            while !mc_render::RENDER_DONE.load(core::sync::atomic::Ordering::Acquire) {
+                embassy_futures::yield_now().await;
+            }
+
+            // Combine core 1 output
+            #[allow(static_mut_refs)]
+            for i in 0..N {
+                output[i] = qadd(output[i], unsafe { mc_render::CORE1_BUF[i] });
+            }
+
+            if render_cycles > peak_cycles {
+                peak_cycles = render_cycles;
+            }
+
+            // Convert to f32, filter, soft-clip, scale to 10-bit PWM duty
+            for i in 0..N {
+                let sample_f32 = output[i] as f32 / (67108864.0 * 3.0);
+                let filtered = filter.process(sample_f32);
+                let x = filtered;
+                let soft = if x > 1.0 {
+                    1.0
+                } else if x < -1.0 {
+                    -1.0
+                } else {
+                    x * (27.0 + x * x) / (27.0 + 9.0 * x * x)
+                };
+                let duty = (soft * 512.0 + 512.5) as i32;
+                duties[i] = usat::<10>(duty) as u16;
+            }
+
+            // Wait for DMA buffer, yield to let BLE tasks run
+            while !dma_audio::poll_and_check() {
+                embassy_futures::yield_now().await;
+            }
+            unsafe {
+                let buf = dma_audio::get_fill_buffer();
+                for i in 0..N {
+                    buf[i] = (duties[i] as u32) << 16;
+                }
+                dma_audio::buffer_filled();
+            }
+
+            // Log CPU utilization once per second
+            block_count += 1;
+            if block_count >= blocks_per_sec {
+                let cpu_pct = ((peak_cycles as u64 * 100) / budget_cycles as u64) as u32;
+                info!("CPU: {}%", cpu_pct);
+                block_count = 0;
+                peak_cycles = 0;
+            }
+
+            embassy_futures::yield_now().await;
+        }
+    };
+
+        // Run BLE host + BLE task + audio render concurrently
+        embassy_futures::join::join3(ble_host_task, ble_task, audio_render).await
+    };
+
+    // Run CYW43 driver alongside everything else.
+    // cyw43_task must be running before control.init() inside ble_and_audio.
+    embassy_futures::join::join(cyw43_task, ble_and_audio).await;
     core::unreachable!()
 }
