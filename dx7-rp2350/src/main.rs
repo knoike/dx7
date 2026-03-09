@@ -374,9 +374,15 @@ embassy_rp::bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => embassy_rp::usb::InterruptHandler<embassy_rp::peripherals::USB>;
 });
 
-#[cfg(feature = "ble-midi")]
+#[cfg(all(feature = "ble-midi", not(feature = "usb-midi")))]
 embassy_rp::bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<embassy_rp::peripherals::PIO0>;
+});
+
+#[cfg(all(feature = "ble-midi", feature = "usb-midi"))]
+embassy_rp::bind_interrupts!(struct Irqs {
+    PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<embassy_rp::peripherals::PIO0>;
+    USBCTRL_IRQ => embassy_rp::usb::InterruptHandler<embassy_rp::peripherals::USB>;
 });
 
 // --- Entry point ---
@@ -420,20 +426,29 @@ async fn main(_spawner: Spawner) {
 
     // === Feature-gated playback ===
 
-    // BLE MIDI synth never returns
-    #[cfg(all(feature = "ble-midi", feature = "pwm"))]
+    // USB + BLE MIDI synth (both active simultaneously)
+    #[cfg(all(feature = "usb-midi", feature = "ble-midi", feature = "pwm"))]
+    usb_ble_midi_pwm_synth(
+        p.USB,
+        p.PIO0, p.PIN_23, p.PIN_24, p.PIN_25, p.PIN_29,
+        p.DMA_CH2, p.PWM_SLICE7, p.PIN_15, p.CORE1,
+    ).await;
+
+    // BLE MIDI only
+    #[cfg(all(feature = "ble-midi", not(feature = "usb-midi"), feature = "pwm"))]
     ble_midi_pwm_synth(
         p.PIO0, p.PIN_23, p.PIN_24, p.PIN_25, p.PIN_29,
         p.DMA_CH2, p.PWM_SLICE7, p.PIN_15, p.CORE1,
     ).await;
 
-    // USB MIDI synth never returns
+    // USB MIDI only
     #[cfg(all(feature = "usb-midi", not(feature = "ble-midi"), feature = "pwm"))]
     usb_midi_pwm_synth(p.USB, p.PWM_SLICE7, p.PIN_15, p.CORE1).await;
 
     #[cfg(not(any(
-        all(feature = "ble-midi", feature = "pwm"),
-        all(feature = "usb-midi", feature = "pwm"),
+        all(feature = "usb-midi", feature = "ble-midi", feature = "pwm"),
+        all(feature = "ble-midi", not(feature = "usb-midi"), feature = "pwm"),
+        all(feature = "usb-midi", not(feature = "ble-midi"), feature = "pwm"),
     )))]
     {
         #[cfg(all(feature = "pwm", not(feature = "usb-midi"), not(feature = "ble-midi")))]
@@ -885,9 +900,474 @@ async fn usb_midi_pwm_synth(
     core::unreachable!()
 }
 
+// === USB + BLE MIDI combined synth (dual-core, CYW43) ===
+
+#[cfg(all(feature = "usb-midi", feature = "ble-midi", feature = "pwm"))]
+async fn usb_ble_midi_pwm_synth(
+    usb_peripheral: Peri<'static, embassy_rp::peripherals::USB>,
+    pio0: Peri<'static, embassy_rp::peripherals::PIO0>,
+    pin_23: Peri<'static, embassy_rp::peripherals::PIN_23>,
+    pin_24: Peri<'static, embassy_rp::peripherals::PIN_24>,
+    pin_25: Peri<'static, embassy_rp::peripherals::PIN_25>,
+    pin_29: Peri<'static, embassy_rp::peripherals::PIN_29>,
+    dma_ch2: Peri<'static, embassy_rp::peripherals::DMA_CH2>,
+    pwm_slice: Peri<'static, embassy_rp::peripherals::PWM_SLICE7>,
+    pwm_pin: Peri<'static, embassy_rp::peripherals::PIN_15>,
+    core1: Peri<'static, embassy_rp::peripherals::CORE1>,
+) -> ! {
+    use embassy_rp::pwm::{Config as PwmConfig, Pwm};
+    use embassy_rp::gpio::{Level, Output};
+    use embassy_rp::pio::Pio;
+    use embassy_rp::usb::Driver;
+    use trouble_host::prelude::*;
+
+    info!("USB+BLE MIDI synth with PWM output on GP15 (dual-core render)");
+
+    // Setup PWM (10-bit: 200MHz/1024 ≈ 195kHz carrier)
+    let mut pwm_config = PwmConfig::default();
+    pwm_config.top = 1023;
+    pwm_config.compare_b = 512;
+    let _pwm = Pwm::new_output_b(pwm_slice, pwm_pin, pwm_config);
+
+    // Initialize shared voice pool
+    #[allow(static_mut_refs)]
+    unsafe {
+        mc_render::VOICES.write(core::array::from_fn(|_| Voice::new()));
+    }
+
+    // Start core 1 for parallel voice rendering
+    #[allow(static_mut_refs)]
+    unsafe {
+        embassy_rp::multicore::spawn_core1(core1, &mut CORE1_STACK, || -> ! {
+            mc_render::core1_entry()
+        });
+    }
+
+    // --- CYW43 initialization ---
+    let pwr = Output::new(pin_23, Level::Low);
+    let cs = Output::new(pin_25, Level::High);
+    let mut pio = Pio::new(pio0, Irqs);
+    let clock_div = fixed::FixedU32::<fixed::types::extra::U8>::from_num(4);
+    let spi = cyw43_pio::PioSpi::new(
+        &mut pio.common,
+        pio.sm0,
+        clock_div,
+        pio.irq0,
+        cs,
+        pin_24,
+        pin_29,
+        dma_ch2,
+    );
+
+    static CYW43_STATE: static_cell::StaticCell<cyw43::State> = static_cell::StaticCell::new();
+    let state = CYW43_STATE.init(cyw43::State::new());
+
+    let (_net_device, bt_device, mut control, runner) =
+        cyw43::new_with_bluetooth(state, pwr, spi, cyw43_fw::FW, cyw43_fw::BTFW).await;
+
+    // GATT server
+    #[gatt_server]
+    struct MidiServer {
+        midi_svc: MidiSvc,
+    }
+
+    #[gatt_service(uuid = "03B80E5A-EDE8-4B33-A751-6CE34EC4C700")]
+    struct MidiSvc {
+        #[characteristic(uuid = "7772E5DB-3868-4112-A1A9-F2669D106BF3", write_without_response, read, notify)]
+        midi_io: [u8; 20],
+    }
+
+    static MIDI_QUEUE: dx7_midi::MidiQueue = dx7_midi::MidiQueue::new();
+
+    // SysEx reception buffer (max 4104 bytes for DX7 32-voice bulk dump)
+    static mut SYSEX_RX_BUF: [u8; 4200] = [0u8; 4200];
+    static mut SYSEX_RX_POS: usize = 0;
+    static mut SYSEX_RX_ACTIVE: bool = false;
+    static mut SYSEX_BANK: [u8; 4096] = [0u8; 4096];
+    static SYSEX_BANK_LOADED: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+
+    // --- Setup USB MIDI ---
+    let driver = Driver::new(usb_peripheral, Irqs);
+    let mut usb_config = embassy_usb::Config::new(0x1209, 0x0001);
+    usb_config.manufacturer = Some("DX7");
+    usb_config.product = Some("DX7 MIDI Synth");
+    usb_config.serial_number = Some("DX7-RPI-001");
+
+    let mut config_descriptor = [0u8; 256];
+    let mut bos_descriptor = [0u8; 256];
+    let mut msos_descriptor = [0u8; 256];
+    let mut control_buf = [0u8; 64];
+
+    let mut builder = embassy_usb::Builder::new(
+        driver,
+        usb_config,
+        &mut config_descriptor,
+        &mut bos_descriptor,
+        &mut msos_descriptor,
+        &mut control_buf,
+    );
+
+    let midi = embassy_usb::class::midi::MidiClass::new(&mut builder, 1, 1, 64);
+    let mut usb = builder.build();
+    let (mut sender, mut receiver) = midi.split();
+
+    // Task: CYW43 background driver
+    let cyw43_task = runner.run();
+
+    // Task: USB device driver
+    let usb_run = usb.run();
+
+    // Task: USB MIDI reader (with SysEx accumulation)
+    let midi_read = async {
+        loop {
+            receiver.wait_connection().await;
+            let mut buf = [0u8; 64];
+            match receiver.read_packet(&mut buf).await {
+                Ok(n) => {
+                    for chunk in buf[..n].chunks_exact(4) {
+                        let cin = chunk[0] & 0x0F;
+                        match cin {
+                            0x04 => {
+                                #[allow(static_mut_refs)]
+                                unsafe {
+                                    if chunk[1] == 0xF0 {
+                                        SYSEX_RX_POS = 0;
+                                        SYSEX_RX_ACTIVE = true;
+                                    }
+                                    if SYSEX_RX_ACTIVE {
+                                        for &b in &chunk[1..4] {
+                                            if SYSEX_RX_POS < SYSEX_RX_BUF.len() {
+                                                SYSEX_RX_BUF[SYSEX_RX_POS] = b;
+                                                SYSEX_RX_POS += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            0x05 | 0x06 | 0x07 => {
+                                #[allow(static_mut_refs)]
+                                unsafe {
+                                    if SYSEX_RX_ACTIVE {
+                                        let count = (cin - 0x04) as usize;
+                                        for &b in &chunk[1..1 + count] {
+                                            if SYSEX_RX_POS < SYSEX_RX_BUF.len() {
+                                                SYSEX_RX_BUF[SYSEX_RX_POS] = b;
+                                                SYSEX_RX_POS += 1;
+                                            }
+                                        }
+                                        let len = SYSEX_RX_POS;
+                                        if len == 4104
+                                            && SYSEX_RX_BUF[0] == 0xF0
+                                            && SYSEX_RX_BUF[1] == 0x43
+                                            && (SYSEX_RX_BUF[2] & 0xF0) == 0x00
+                                            && SYSEX_RX_BUF[3] == 0x09
+                                            && SYSEX_RX_BUF[4] == 0x20
+                                            && SYSEX_RX_BUF[5] == 0x00
+                                            && SYSEX_RX_BUF[4103] == 0xF7
+                                        {
+                                            let sum: u8 = SYSEX_RX_BUF[6..4102]
+                                                .iter()
+                                                .fold(0u8, |acc, &b| acc.wrapping_add(b));
+                                            let expected = (!sum).wrapping_add(1) & 0x7F;
+                                            if expected == SYSEX_RX_BUF[4102] {
+                                                SYSEX_BANK.copy_from_slice(
+                                                    &SYSEX_RX_BUF[6..4102],
+                                                );
+                                                SYSEX_BANK_LOADED.store(
+                                                    true,
+                                                    core::sync::atomic::Ordering::Release,
+                                                );
+                                                info!("SysEx: loaded 32-voice bank");
+                                            } else {
+                                                info!(
+                                                    "SysEx: checksum mismatch ({} vs {})",
+                                                    expected, SYSEX_RX_BUF[4102]
+                                                );
+                                            }
+                                        } else if len > 0 {
+                                            info!("SysEx: ignored ({} bytes)", len);
+                                        }
+                                        SYSEX_RX_ACTIVE = false;
+                                    }
+                                }
+                            }
+                            _ => {
+                                dx7_midi::usb::parse_usb_midi_event(chunk, &MIDI_QUEUE);
+                            }
+                        }
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+    };
+
+    // Everything else runs after CYW43 runner is started (via join)
+    let ble_usb_and_audio = async {
+        // CYW43 control init
+        control.init(cyw43_fw::CLM).await;
+        control.set_power_management(cyw43::PowerManagementMode::PowerSave).await;
+        control.gpio_set(0, true).await;
+        info!("CYW43 initialized with Bluetooth");
+
+        // trouble-host BLE stack
+        let controller: ExternalController<_, 1> = ExternalController::new(bt_device);
+        let address: Address = Address::random([0xD7, 0x07, 0x42, 0x01, 0x02, 0x03]);
+
+        let mut resources: HostResources<DefaultPacketPool, 1, 2> = HostResources::new();
+        let stack = trouble_host::new(controller, &mut resources).set_random_address(address);
+        let Host { mut peripheral, runner: mut ble_runner, .. } = stack.build();
+
+        let server = MidiServer::new_with_config(GapConfig::default("DX7")).unwrap();
+
+        let ble_host_task = ble_runner.run();
+
+        // BLE MIDI advertise + connection handler
+        let ble_task = async {
+            const MIDI_SVC_UUID: [u8; 16] = [
+                0x00, 0xC7, 0xC4, 0x4E, 0xE3, 0x6C, 0x51, 0xA7,
+                0x33, 0x4B, 0xE8, 0xED, 0x5A, 0x0E, 0xB8, 0x03,
+            ];
+            loop {
+                let mut adv_buf = [0u8; 31];
+                let adv_len = AdStructure::encode_slice(
+                    &[
+                        AdStructure::Flags(LE_GENERAL_DISCOVERABLE | BR_EDR_NOT_SUPPORTED),
+                        AdStructure::ServiceUuids128(&[MIDI_SVC_UUID]),
+                        AdStructure::CompleteLocalName(b"DX7"),
+                    ],
+                    &mut adv_buf,
+                ).unwrap();
+
+                let adv_data = Advertisement::ConnectableScannableUndirected {
+                    adv_data: &adv_buf[..adv_len],
+                    scan_data: &[],
+                };
+
+                info!("BLE: advertising as 'DX7'...");
+                let advertiser = peripheral.advertise(&Default::default(), adv_data).await.unwrap();
+                let conn = advertiser.accept().await.unwrap();
+                info!("BLE: connected!");
+
+                let gatt_conn = conn.with_attribute_server(&server).unwrap();
+
+                loop {
+                    match gatt_conn.next().await {
+                        GattConnectionEvent::Disconnected { .. } => {
+                            info!("BLE: disconnected");
+                            break;
+                        }
+                        GattConnectionEvent::Gatt { event } => {
+                            match event {
+                                GattEvent::Write(write_evt) => {
+                                    let data = write_evt.data();
+                                    dx7_midi::ble::parse_ble_midi_packet(data, &MIDI_QUEUE);
+                                    let _ = write_evt.accept();
+                                }
+                                other => { let _ = other.accept(); }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        };
+
+        // Audio render loop (shared MIDI_QUEUE fed by both USB and BLE)
+        let audio_render = async {
+            #[allow(static_mut_refs)]
+            let voices = unsafe { mc_render::VOICES.assume_init_mut() };
+            #[allow(static_mut_refs)]
+            let voice_ages = unsafe { &mut mc_render::VOICE_AGES };
+            #[allow(static_mut_refs)]
+            let voice_age = unsafe { &mut mc_render::VOICE_AGE };
+            let mut current_patch = load_rom1a_voice(0).unwrap();
+            let mut output = [0i32; N];
+            let mut duties = [0u16; N];
+            static mut FILTER: OutputFilterF32 = OutputFilterF32 {
+                dc1: DcBlockerF32 { r: 0.9993455, x1: 0.0, y1: 0.0 },
+                dc2: DcBlockerF32 { r: 0.9993455, x1: 0.0, y1: 0.0 },
+                lpf1: BiquadF32 {
+                    b0: 0.21113742, b1: 0.42227485, b2: 0.21113742,
+                    a1: -0.20469809, a2: 0.04924778,
+                    x1: 0.0, x2: 0.0, y1: 0.0, y2: 0.0,
+                },
+                lpf2: BiquadF32 {
+                    b0: 0.29262414, b1: 0.58524828, b2: 0.29262414,
+                    a1: -0.28369960, a2: 0.45419615,
+                    x1: 0.0, x2: 0.0, y1: 0.0, y2: 0.0,
+                },
+            };
+            #[allow(static_mut_refs)]
+            let filter = unsafe { &mut FILTER };
+
+            let budget_cycles = (N as u32 * CPU_HZ) / SAMPLE_RATE;
+            let blocks_per_sec = SAMPLE_RATE / N as u32;
+            let mut block_count: u32 = 0;
+            let mut peak_cycles: u32 = 0;
+            let mut peak_raw: i32 = 0;
+            let mut peak_duty_off: u16 = 0;
+
+            unsafe { dma_audio::init(); }
+
+            info!("USB+BLE MIDI ready — dual-core, {} voices, DMA audio", MAX_VOICES);
+
+            loop {
+                // Drain MIDI queue (fed by both USB and BLE)
+                while let Some(msg) = MIDI_QUEUE.pop() {
+                    match msg {
+                        dx7_midi::MidiMessage::NoteOn { note, velocity } => {
+                            *voice_age += 1;
+                            let slot = voices.iter().position(|v| v.is_finished())
+                                .or_else(|| {
+                                    voices.iter().enumerate()
+                                        .filter(|(_, v)| v.state == VoiceState::Released)
+                                        .min_by_key(|(i, _)| voice_ages[*i])
+                                        .map(|(i, _)| i)
+                                })
+                                .unwrap_or_else(|| {
+                                    (0..MAX_VOICES).min_by_key(|&i| voice_ages[i]).unwrap()
+                                });
+                            voices[slot].note_on(&current_patch, note, velocity);
+                            voice_ages[slot] = *voice_age;
+                        }
+                        dx7_midi::MidiMessage::NoteOff { note, .. } => {
+                            for v in voices.iter_mut() {
+                                if v.note == note && !v.is_finished() {
+                                    v.note_off();
+                                    break;
+                                }
+                            }
+                        }
+                        dx7_midi::MidiMessage::ProgramChange { program } => {
+                            if program == 32 {
+                                current_patch = dx7_core::DxVoice::init_voice();
+                            } else if SYSEX_BANK_LOADED.load(core::sync::atomic::Ordering::Acquire) {
+                                let idx = program as usize;
+                                if idx < 32 {
+                                    let start = idx * 128;
+                                    let mut voice_data = [0u8; 128];
+                                    #[allow(static_mut_refs)]
+                                    unsafe {
+                                        voice_data.copy_from_slice(
+                                            &SYSEX_BANK[start..start + 128],
+                                        );
+                                    }
+                                    current_patch =
+                                        dx7_core::DxVoice::from_packed(&voice_data);
+                                    info!("Loaded sysex patch {}", idx);
+                                }
+                            } else if let Some(p) = load_rom1a_voice(program as usize) {
+                                current_patch = p;
+                            }
+                        }
+                        dx7_midi::MidiMessage::ControlChange { .. } => {}
+                        _ => {}
+                    }
+                }
+
+                // Signal core 1
+                mc_render::RENDER_DONE.store(false, core::sync::atomic::Ordering::Relaxed);
+                mc_render::RENDER_START.store(true, core::sync::atomic::Ordering::Release);
+
+                // Render voices 0..MAX_VOICES/2 on core 0
+                output.fill(0);
+                let render_start = read_cycles();
+                for idx in 0..(MAX_VOICES / 2) {
+                    if !voices[idx].is_finished() {
+                        let mut voice_buf = [0i32; N];
+                        voices[idx].render(&mut voice_buf);
+                        for i in 0..N {
+                            output[i] = qadd(output[i], voice_buf[i]);
+                        }
+                    }
+                }
+                let render_cycles = read_cycles().wrapping_sub(render_start);
+
+                while !mc_render::RENDER_DONE.load(core::sync::atomic::Ordering::Acquire) {
+                    embassy_futures::yield_now().await;
+                }
+
+                #[allow(static_mut_refs)]
+                for i in 0..N {
+                    output[i] = qadd(output[i], unsafe { mc_render::CORE1_BUF[i] });
+                }
+
+                if render_cycles > peak_cycles {
+                    peak_cycles = render_cycles;
+                }
+
+                for i in 0..N {
+                    let raw_abs = output[i].abs();
+                    if raw_abs > peak_raw { peak_raw = raw_abs; }
+                    let sample_f32 = output[i] as f32 / (67108864.0 * 3.0);
+                    let filtered = filter.process(sample_f32);
+                    let x = filtered;
+                    let soft = if x > 1.0 {
+                        1.0
+                    } else if x < -1.0 {
+                        -1.0
+                    } else {
+                        x * (27.0 + x * x) / (27.0 + 9.0 * x * x)
+                    };
+                    let duty = (soft * 512.0 + 512.5) as i32;
+                    duties[i] = usat::<10>(duty) as u16;
+                    let off = if duties[i] >= 512 { duties[i] - 512 } else { 512 - duties[i] };
+                    if off > peak_duty_off { peak_duty_off = off; }
+                }
+
+                while !dma_audio::poll_and_check() {
+                    embassy_futures::yield_now().await;
+                }
+                unsafe {
+                    let buf = dma_audio::get_fill_buffer();
+                    for i in 0..N {
+                        buf[i] = (duties[i] as u32) << 16;
+                    }
+                    dma_audio::buffer_filled();
+                }
+
+                // Send diagnostics via USB once per second
+                block_count += 1;
+                if block_count >= blocks_per_sec {
+                    let cpu_pct = ((peak_cycles as u64 * 127) / budget_cycles as u64) as u8;
+                    let cpu_val = if cpu_pct > 127 { 127 } else { cpu_pct };
+                    let _ = sender.write_packet(&[0x0B, 0xB0, 0x77, cpu_val]).await;
+                    let duty_val = ((peak_duty_off as u32 * 127) / 512).min(127) as u8;
+                    let _ = sender.write_packet(&[0x0B, 0xB0, 0x76, duty_val]).await;
+                    let raw_bits = if peak_raw == 0 { 0u8 } else { (32 - peak_raw.leading_zeros()) as u8 };
+                    let raw_val = ((raw_bits as u16 * 127) / 26).min(127) as u8;
+                    let _ = sender.write_packet(&[0x0B, 0xB0, 0x75, raw_val]).await;
+
+                    block_count = 0;
+                    peak_cycles = 0;
+                    peak_raw = 0;
+                    peak_duty_off = 0;
+                }
+
+                embassy_futures::yield_now().await;
+            }
+        };
+
+        // Run USB driver, USB MIDI reader, BLE host, BLE task, and audio concurrently
+        embassy_futures::join::join3(
+            ble_host_task,
+            ble_task,
+            audio_render,
+        ).await
+    };
+
+    // CYW43 runner + USB driver must run alongside everything else
+    embassy_futures::join::join3(cyw43_task, usb_run,
+        embassy_futures::join::join(midi_read, ble_usb_and_audio),
+    ).await;
+    core::unreachable!()
+}
+
 // === BLE MIDI + PWM live synth (dual-core, CYW43) ===
 
-#[cfg(all(feature = "ble-midi", feature = "pwm"))]
+#[cfg(all(feature = "ble-midi", not(feature = "usb-midi"), feature = "pwm"))]
 async fn ble_midi_pwm_synth(
     pio0: Peri<'static, embassy_rp::peripherals::PIO0>,
     pin_23: Peri<'static, embassy_rp::peripherals::PIN_23>,
